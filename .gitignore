@@ -1,0 +1,49 @@
+# Local secrets / credentials
+.env
+.env.*
+!.env-template
+*.pem
+*.key
+*.p12
+*.pfx
+*.crt
+*.csr
+
+# Local Terraform
+.terraform/
+*.tfstate
+*.tfstate.*
+crash.log
+crash.*.log
+*.tfvars
+*.auto.tfvars.json
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+.terraform.tfstate.lock.info
+
+# Plan output
+*.tfplan
+tfplan
+*.log
+*-apply.log
+
+# OS / editor
+.DS_Store
+.idea/
+.mcp.json
+.playwright-mcp/
+.vscode/*
+.venv/
+
+# Local caches / generated artifacts
+.cache/
+tmp/
+*.pdf
+
+# Local working notes
+/ISSUES.md
+
+# Misc
+/tmp

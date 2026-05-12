@@ -1,0 +1,160 @@
+###############################################################################
+# Plan-only validation test for Phase 1.
+# Does not call Azure APIs (uses `command = plan`) — verifies that the
+# composition is syntactically valid, all required variables have defaults,
+# and naming logic produces the expected resource names.
+#
+# Run with:
+#   terraform test
+###############################################################################
+
+variables {
+  # Real subscription required for the azurerm provider's CLI authorizer to
+  # initialize, even for plan-only tests.
+  azure_subscription_id = "24a4c592-bfaf-492f-beaf-f10b3b67f03f"
+  azure_tenant_id       = "6f070e41-8d1e-45c9-af17-551c9b98860d"
+
+  project        = "myproject"
+  environment    = "dev"
+  azure_location = "westus3"
+  region_short   = "wus3"
+
+  vnet_address_space = ["10.50.0.0/16"]
+  subnet_cidrs = {
+    firewall            = "10.50.0.0/26"
+    firewall_management = "10.50.0.64/26"
+    bastion             = "10.50.0.128/26"
+    aks_apiserver       = "10.50.1.0/28"
+    dns_resolver_in     = "10.50.1.16/28"
+    dns_resolver_out    = "10.50.1.32/28"
+    private_endpoints   = "10.50.2.0/24"
+    aks_nodes           = "10.50.4.0/22"
+  }
+
+  dns_forwarding_rules = {}
+
+  anyscale_fqdns = [
+    "console.anyscale.com",
+    "console.azure.anyscale.com",
+    "api.azure.anyscale.com",
+    "*.az1.westus2.admin.azure.anyscale.com",
+    "anyscaleazwestus2prod.blob.core.windows.net",
+    "anyscaleazwestus2prod.dfs.core.windows.net",
+    "api.anyscale.com",
+    "anyscale-public.s3.us-west-2.amazonaws.com",
+    "anyscale.com",
+  ]
+
+  container_registry_fqdns = [
+    "mcr.microsoft.com",
+    "*.data.mcr.microsoft.com",
+    "ghcr.io",
+    "*.ghcr.io",
+    "pkg-containers.githubusercontent.com",
+    "*.docker.io",
+    "registry-1.docker.io",
+    "auth.docker.io",
+    "production.cloudflare.docker.com",
+    "quay.io",
+    "*.quay.io",
+    "registry.k8s.io",
+    "k8s.gcr.io",
+    "gcr.io",
+    "*.gcr.io",
+    "*.pkg.dev",
+    "us-docker.pkg.dev",
+    "europe-docker.pkg.dev",
+    "asia-docker.pkg.dev",
+    "nvcr.io",
+    "*.nvcr.io",
+    "authn.nvidia.com",
+    "arcmktplaceprod.azurecr.io",
+    "*.data.azurecr.io",
+    "prod-registry-k8s-io-us-west-1.s3.dualstack.us-west-1.amazonaws.com",
+  ]
+
+  system_vm_size = "Standard_D2s_v5"
+  cpu_vm_size    = "Standard_D16s_v5"
+  gpu_pool_configs = {
+    T4 = {
+      name         = "gput4"
+      vm_size      = "Standard_NC16as_T4_v3"
+      product_name = "NVIDIA-T4"
+      gpu_count    = "1"
+      min_count    = 1
+      max_count    = 2
+    }
+  }
+
+  kubernetes_version               = "1.34.6"
+  service_cidr                     = "10.100.0.0/16"
+  dns_service_ip                   = "10.100.0.10"
+  anyscale_operator_namespace      = "anyscale-operator"
+  anyscale_operator_serviceaccount = "anyscale-operator"
+  cluster_bootstrap = {
+    enabled = false
+  }
+  anyscale_platform = {
+    enabled = false
+  }
+  storage_cors_rule = {
+    allowed_headers    = ["*"]
+    allowed_methods    = ["GET", "POST", "PUT", "HEAD", "DELETE"]
+    allowed_origins    = ["https://*.anyscale.com"]
+    expose_headers     = ["Accept-Ranges", "Content-Range", "Content-Length"]
+    max_age_in_seconds = 0
+  }
+
+  log_analytics_retention_days = 30
+  tags = {
+    Project     = "myproject"
+    Environment = "dev"
+    ManagedBy   = "terraform"
+    Owner       = "terraform-test"
+  }
+}
+
+run "naming_and_validate_plan" {
+  command = plan
+
+  assert {
+    condition     = output.resource_group_name == "rg-myproject-dev-wus3"
+    error_message = "Resource group name does not match the CAF naming convention."
+  }
+
+  assert {
+    condition     = output.aks_cluster_name == "aks-myproject-dev-wus3"
+    error_message = "AKS cluster name does not match the CAF naming convention."
+  }
+
+  assert {
+    condition     = output.bastion_name == "bas-myproject-dev-wus3"
+    error_message = "Bastion name does not match the CAF naming convention."
+  }
+
+  assert {
+    condition     = length(output.dns_resolver_inbound_endpoint_ip) > 0
+    error_message = "DNS Private Resolver inbound endpoint IP must be exported."
+  }
+
+  assert {
+    condition     = output.private_mode_validation.observability.ampls_enabled == true && output.private_mode_validation.container_insights.container_log_v2_enabled == true
+    error_message = "Plan must include AMPLS and ContainerLogV2 observability posture."
+  }
+
+  assert {
+    condition     = output.anyscale_operator_workload_identity.namespace == "anyscale-operator" && output.anyscale_operator_workload_identity.service_account == "anyscale-operator" && output.anyscale_operator_workload_identity.pod_labels["azure.workload.identity/use"] == "true" && contains(keys(output.anyscale_operator_workload_identity.service_account_annotations), "azure.workload.identity/client-id")
+    error_message = "Anyscale operator Workload Identity install values must expose the namespace, service account, pod label, and client-id annotation."
+  }
+
+  assert {
+    condition     = output.cluster_bootstrap_contract.enabled == false && output.cluster_bootstrap_contract.access_mode == "bastion-kubeconfig" && output.cluster_bootstrap_contract.service_account.annotations["meta.helm.sh/release-name"] == "anyscaleoperator" && output.cluster_bootstrap_contract.helm_releases.nvidia_device_plugin.chart_version == "0.17.1" && output.cluster_bootstrap_contract.helm_releases.ingress_nginx.service_annotations["service.beta.kubernetes.io/azure-load-balancer-internal"] == "true"
+    error_message = "The Terraform bootstrap contract must expose the Bastion kubeconfig access mode, Helm-adoptable service account metadata, and pinned Helm release settings."
+  }
+
+  assert {
+    condition     = output.anyscale_platform_contract.extension_configuration_settings["workloads.accelerator.tolerations.default[0].key"] == "node.anyscale.com/accelerator-type" && output.anyscale_platform_contract.extension_configuration_settings["workloads.accelerator.tolerations.default[1].key"] == "nvidia.com/gpu" && output.anyscale_platform_contract.extension_configuration_settings["workloads.accelerator.tolerations.default[1].operator"] == "Exists"
+    error_message = "The Anyscale extension contract must declaratively include both the accelerator-type and nvidia.com/gpu toleration settings for tainted AKS GPU pools."
+  }
+
+}
