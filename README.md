@@ -24,7 +24,7 @@ For the local workstation, work from a macOS or Linux shell with Git, Azure CLI,
 
 For Azure access, you need to be able to log in to the target tenant and subscription and create the full set of resources this stack uses: networking, Azure Firewall, Azure Bastion, AKS, Private Link, storage, ACR, Log Analytics, managed identities, federated identity credentials, and RBAC assignments. If the target subscription has not already accepted the Anyscale marketplace offer, it also needs permission to create or accept that agreement during the phase-2 deployment. The sample configuration assumes GPU quota for `Standard_NC16as_T4_v3` in the target region because the default validated path keeps one T4 node warm for workspace and smoke-test bring-up.
 
-For Anyscale access, the infrastructure deployment itself does not require an API token, but the post-deploy helper commands do. `./scripts/setup.sh anyscale-workspace-ready` and `./scripts/setup.sh workspace-intro-smoke` both require `ANYSCALE_CLI_TOKEN` in `.env`, and they also expect the repo-local CLI binary at `.venv/bin/anyscale`. You can still use `anyscale login` for interactive exploration, but the scripted post-configuration path is token-based.
+For Anyscale access, the infrastructure deployment itself does not require an API token, but the post-deploy helper commands do. `./scripts/setup.sh anyscale-workspace-ready` and `./scripts/setup.sh anyscale-workspaces-register` both require `ANYSCALE_CLI_TOKEN` in `.env`, and they also expect the repo-local CLI binary at `.venv/bin/anyscale`. You can still use `anyscale login` for interactive exploration, but the scripted post-configuration path is token-based.
 
 ## Start from a fresh clone
 
@@ -59,7 +59,7 @@ source .venv/bin/activate
 UV_CACHE_DIR="$PWD/.cache/uv-cache" uv pip install --python .venv/bin/python anyscale
 ```
 
-If you want an interactive CLI session for manual exploration, you can run `.venv/bin/anyscale login`. That is useful for ad hoc inspection, but it does not replace `ANYSCALE_CLI_TOKEN` for `anyscale-workspace-ready` or `workspace-intro-smoke`; those helpers read the token from `.env` and fail fast when it is missing.
+If you want an interactive CLI session for manual exploration, you can run `.venv/bin/anyscale login`. That is useful for ad hoc inspection, but it does not replace `ANYSCALE_CLI_TOKEN` for `anyscale-workspace-ready` or `anyscale-workspaces-register`; those helpers read the token from `.env` and fail fast when it is missing.
 
 ## Understand the deployment flow before you start
 
@@ -136,9 +136,9 @@ eval "$(./scripts/setup.sh kubeconfig-bastion --export)"
 kubectl get nodes -o wide
 ```
 
-This is the path the repo uses for local `kubectl`, `helm`, `./scripts/setup.sh anyscale-workspace-ready`, `./scripts/setup.sh workspace-intro-smoke`, `./scripts/setup.sh validate-focused`, and `./scripts/setup.sh validate-k8s`. `./scripts/setup.sh bastion-tunnel status` tells you whether the local listener is already running, `./scripts/setup.sh bastion-tunnel stop` shuts it down, and `./scripts/setup.sh kubeconfig-bastion --admin --export` is the break-glass admin variant.
+This is the path the repo uses for local `kubectl`, `helm`, `./scripts/setup.sh anyscale-workspace-ready`, `./scripts/setup.sh anyscale-workspaces-register`, `./scripts/setup.sh validate-focused`, and `./scripts/setup.sh validate-k8s`. `./scripts/setup.sh bastion-tunnel status` tells you whether the local listener is already running, `./scripts/setup.sh bastion-tunnel stop` shuts it down, and `./scripts/setup.sh kubeconfig-bastion --admin --export` is the break-glass admin variant.
 
-## Patch the Anyscale operator and run the end-to-end smoke path
+## Patch the Anyscale operator and register the CPU and GPU workspaces
 
 If phase 2 did not auto-run the operator patch, start from a shell that already has Bastion-backed access and run the helper directly.
 
@@ -149,14 +149,71 @@ eval "$(./scripts/setup.sh kubeconfig-bastion --export)"
 
 That command validates the repo-local Anyscale CLI against `ANYSCALE_HOST`, discovers the installed `anyscale-operator` Helm release and chart version, builds an AKS-specific values overlay, upgrades the live release in place, verifies that the expected CPU and GPU instance types appear in the `instance-types` ConfigMap, and checks the operator patch ConfigMap for the AKS GPU toleration changes. The generated overlay is written to `.cache/anyscale-operator.workspace-ready.values.yaml` so you can inspect exactly what the helper applied.
 
-After that patch is in place, the fastest full post-deploy proof is the workspace smoke test.
+Once the operator patch is in place, register the dedicated CPU and GPU workspaces with a single command.
 
 ```bash
-./scripts/setup.sh workspace-intro-smoke
-./scripts/setup.sh workspace-intro-smoke --keep-workspace
+./scripts/setup.sh anyscale-workspaces-register
 ```
 
-`workspace-intro-smoke` re-runs `anyscale-workspace-ready`, verifies the operator patch, creates or reuses the Anyscale compute config, creates a temporary workspace in the Azure-hosted control plane, installs `emoji`, runs the Intro to Workspaces dependency-management example, and then terminates the workspace unless you keep it alive for debugging. The helper writes the generated compute config and the command logs under `.cache/`, which makes it easy to inspect the exact AKS-aligned post-configuration artifacts without checking them into source control.
+`anyscale-workspaces-register` is idempotent. It re-runs `anyscale-workspace-ready`, ensures the AKS-aligned compute configs `aks-cpu` (head `8CPU-32GB`, worker `cpu-workers` → `14CPU-56GB-CPU`, 0–4 nodes) and `aks-gpu` (head `8CPU-32GB-1xT4-AKS`, worker `gpu-workers` → `8CPU-32GB-1xT4-AKS`, 0–1 nodes) exist, then registers two workspaces against those configs:
+
+- `aks-cpu-workspace` — started automatically and waited until `RUNNING`. The helper then performs a fast structural check: it looks up the Ray head pod and confirms it is scheduled on an `aks-cpu-*` node. It deliberately does **not** run an in-script Ray task, because the head pod publishes `0` schedulable Ray `CPU` resources and the `cpu-workers` group autoscales from `0`; a `num_cpus=1` Ray task therefore blocks on autoscaling that may take several minutes or stall. Run the Ray CPU probe interactively (see the manual validation section below) instead.
+- `aks-gpu-workspace` — **registered only**. The helper does not start it, which keeps the GPU node pool scaled to its baseline until you actually need GPU capacity. Start it manually from the Anyscale console when you are ready to run a GPU workload.
+
+Existing compute configs and workspaces with the same names are reused, so this command is safe to re-run. Generated compute-config YAML and command logs are written under `.cache/` (for example `.cache/anyscale-compute.aks-cpu.yaml`, `.cache/aks-cpu-workspace.validate.log`, `.cache/aks-gpu-workspace.create.log`).
+
+### Manually validate the GPU workspace from the Anyscale console
+
+After `anyscale-workspaces-register` completes, run the GPU proof by hand. This avoids the long `STARTING → RUNNING` wait on every script run and lets you exercise the console flow the way an Anyscale user would.
+
+1. Open the Anyscale console at `https://console.azure.anyscale.com`, switch to the cloud whose name matches `ANYSCALE_CLOUD_NAME` from `.env`, and confirm that both compute configs `aks-cpu` and `aks-gpu` are listed and active.
+2. Open the **Workspaces** view and confirm that `aks-cpu-workspace` is `RUNNING` and that `aks-gpu-workspace` exists in a stopped state.
+3. Open `aks-cpu-workspace` and run a small Ray CPU task in a notebook or terminal, for example:
+
+   ```python
+   import ray
+   ray.init(address="auto")
+
+   @ray.remote(num_cpus=1)
+   def probe():
+       return "CPU_WORKSPACE_OK"
+
+   print(ray.get(probe.remote()))
+   ```
+
+   This mirrors the automated check the script already ran and proves the CPU workspace is interactively usable.
+4. Open `aks-gpu-workspace` and click **Start**. The first start can take roughly six minutes while the GPU node pool scales up from its baseline and the GPU head pod is scheduled; that is expected and is not a hang.
+5. When the GPU workspace reaches `RUNNING`, open a terminal in the workspace and confirm GPU visibility:
+
+   ```bash
+   nvidia-smi -L
+   ```
+
+   You should see a single `Tesla T4` device. Then run a Ray GPU task:
+
+   ```python
+   import os
+   import ray
+   ray.init(address="auto")
+
+   @ray.remote(num_gpus=1)
+   def gpu_probe():
+       return os.environ.get("CUDA_VISIBLE_DEVICES", "none")
+
+   print(ray.get(gpu_probe.remote()))
+   ```
+
+   The task should return `0` (or another non-`none` device index), proving Ray scheduled a GPU-pinned task on the GPU node pool.
+6. From a Bastion-backed shell, confirm the workspace head pods are scheduled on the intended AKS pools:
+
+   ```bash
+   eval "$(./scripts/setup.sh kubeconfig-bastion --export)"
+   kubectl get pods -n anyscale-operator -l ray-node-type=head -o wide
+   ```
+
+   The `aks-cpu-workspace` head pod's node name should start with `aks-cpu-`, and once the GPU workspace is running its head pod's node name should start with `aks-gput4-`.
+
+When you are done, you can stop `aks-gpu-workspace` from the Anyscale console so the GPU node pool scales back down. `aks-cpu-workspace` is safe to leave running as the always-on CPU entrypoint.
 
 ## Validate the codebase and the deployed environment
 
@@ -193,10 +250,10 @@ This repository provisions its own AKS cluster today, but the same integration p
 - The phase-2 ARM and Terraform flow completes without manual portal repair work, and the Azure-native Anyscale cloud resource plus the `anyscaleoperator` AKS extension both reach `Succeeded`.
 - `./scripts/setup.sh anyscale-workspace-ready` succeeds, the live operator release accepts the token patch, and the resulting `instance-types` ConfigMap contains at least one CPU-only instance type and one GPU-backed instance type that map cleanly to the CPU and GPU pools.
 - `./scripts/setup.sh validate-focused`, `./scripts/setup.sh validate-k8s`, and `./scripts/setup.sh control-plane-egress-smoke` all pass, proving private API access, firewall-routed egress, Workload Identity storage access, internal ingress reachability, and GPU scheduling.
-- A workspace can be created successfully in the Anyscale console against the integrated cloud without hitting the validation error that appears when the operator is missing a CPU-only instance type.
-- A notebook attached to a CPU-oriented compute configuration starts successfully and runs a small test workload on the CPU pool using the CPU-only instance type.
-- A notebook attached to a GPU-oriented compute configuration starts successfully and runs a small GPU test workload on the GPU pool, with the notebook session able to detect and use the GPU device through `nvidia-smi`, `torch.cuda.is_available()`, or an equivalent runtime check.
-- The end-to-end smoke path is repeatable, meaning you can re-run `./scripts/setup.sh workspace-intro-smoke` or the equivalent manual console workflow and get a clean success result without reworking the underlying AKS, Bastion, identity, or operator wiring by hand.
+- `./scripts/setup.sh anyscale-workspaces-register` succeeds: it registers the `aks-cpu` and `aks-gpu` compute configs, registers `aks-cpu-workspace` and `aks-gpu-workspace`, starts the CPU workspace, waits until it reaches `RUNNING`, and confirms the CPU head pod is scheduled on the `aks-cpu` node pool.
+- A console session against `aks-cpu-workspace` runs a small Ray CPU task on the CPU pool using the CPU-only instance type.
+- After manually starting `aks-gpu-workspace` from the Anyscale console, a console session runs a small Ray GPU task on the GPU pool, with `nvidia-smi -L` reporting a `Tesla T4` and the Ray task returning a valid `CUDA_VISIBLE_DEVICES` value.
+- The end-to-end path is repeatable: re-running `./scripts/setup.sh anyscale-workspaces-register` reuses the existing compute configs and workspaces without recreating them, and the manual GPU validation can be repeated through the console without reworking the underlying AKS, Bastion, identity, or operator wiring by hand.
 
 ## Inspect the environment during and after deployment
 
@@ -223,7 +280,7 @@ Use `nuke` when you need a full reset after a failed private-cluster experiment 
 
 ## Current validated baseline
 
-The most recent end-to-end rerun completed on `2026-05-12` against Kubernetes `1.34.6` in `westus3`. That run completed the two-phase deployment, left the AKS cluster private and healthy, applied the Terraform-managed bootstrap layer, deployed the Anyscale platform resources, patched the operator successfully, and created the validated CPU and GPU compute configuration used by the workspace smoke path.
+The most recent end-to-end rerun completed on `2026-05-12` against Kubernetes `1.34.6` in `westus3`. That run completed the two-phase deployment, left the AKS cluster private and healthy, applied the Terraform-managed bootstrap layer, deployed the Anyscale platform resources, patched the operator successfully, and registered the AKS-aligned `aks-cpu` and `aks-gpu` compute configs plus the `aks-cpu-workspace` and `aks-gpu-workspace` workspaces used by the manual CPU and GPU validation path.
 
 The two current non-blocking caveats are worth knowing before you rely on the environment as a long-lived reference. The operator pod still emits recurring `502 Bad Gateway` warnings from the `vector` sidecar telemetry sinks on `http://localhost:3100` and `http://localhost:3101/api/v1/push`, and the custom GPU instance type still needs the legacy resource key `'accelerator_type:T4': 1` alongside `accelerators: [T4]` for the live admission webhook. Neither issue blocked the validated workflow, but both are worth keeping in mind when you compare this repository to newer upstream operator behavior.
 

@@ -15,8 +15,7 @@
 #   ./scripts/setup.sh kubeconfig  # fetch Entra kubeconfig + kubelogin conversion
 #   ./scripts/setup.sh kubeconfig-bastion [--admin] [--export] # write kubeconfig pointed at the Bastion tunnel
 #   ./scripts/setup.sh anyscale-workspace-ready # patch the operator with the Azure CLI token and AKS instance types
-#   ./scripts/setup.sh workspace-intro-smoke [--keep-workspace] # run the Anyscale Intro to Workspaces smoke test
-#   ./scripts/setup.sh workspace-compute-ready [--terminate-workspaces] # create/reuse dedicated CPU/GPU workspaces and validate both node pools
+#   ./scripts/setup.sh anyscale-workspaces-register # register aks-cpu/aks-gpu compute configs and aks-cpu-workspace/aks-gpu-workspace; start+validate CPU only
 #   ./scripts/setup.sh post        # explain the Terraform-managed Kubernetes bootstrap flow
 #   ./scripts/setup.sh control-plane-egress-smoke # prove cluster egress to Anyscale control-plane endpoints
 #   ./scripts/setup.sh validate-focused [--skip-observability] # run the live validation suite with pass/fail output
@@ -2169,7 +2168,8 @@ normalize_anyscale_workspace_status() {
 
   printf '%s\n' "${raw_status}" \
     | tail -n 1 \
-    | sed -E 's/^.*\)\s*//' \
+    | sed -E 's/'$'\033''\[[0-9;]*[A-Za-z]//g' \
+    | sed -E 's/^.*\)[[:space:]]*//' \
     | tr -d '\r' \
     | awk '{$1=$1; print}'
 }
@@ -2252,194 +2252,11 @@ workspace_exec_head_bash() {
 }
 
 ###############################################################################
-workspace_intro_smoke() {
-  local workspace_name=""
-  local compute_config_name="aks-cpu-gpu"
-  local keep_workspace=false
-
-  while [[ $# -gt 0 ]]; do
-    case "$1" in
-      --name)
-        [[ $# -ge 2 ]] || die "Missing value for --name"
-        workspace_name="$2"
-        shift 2
-        ;;
-      --compute-config)
-        [[ $# -ge 2 ]] || die "Missing value for --compute-config"
-        compute_config_name="$2"
-        shift 2
-        ;;
-      --keep-workspace)
-        keep_workspace=true
-        shift
-        ;;
-      --help|-h)
-        cat <<'USAGE'
-Usage:
-  ./scripts/setup.sh workspace-intro-smoke
-  ./scripts/setup.sh workspace-intro-smoke --keep-workspace
-  ./scripts/setup.sh workspace-intro-smoke --name my-workspace --compute-config aks-cpu-gpu
-
-Re-runs the Azure-hosted Anyscale operator post-config, validates the operator
-GPU toleration patches, ensures the AKS CPU/GPU compute config exists, then
-executes the Anyscale "Intro to workspaces" dependency-management smoke test
-through the Bastion-backed head pod. Requires a Bastion-backed kubeconfig and
-ANYSCALE_CLI_TOKEN in .env.
-USAGE
-        return 0
-        ;;
-      *)
-        die "Unknown workspace-intro-smoke option: $1"
-        ;;
-    esac
-  done
-
-  load_env
-  sync_anyscale_cli_env
-  require_anyscale_cli
-  require_cluster_kubectl_access
-  require_env_var ANYSCALE_CLI_TOKEN
-  require_env_var ANYSCALE_CLOUD_NAME
-  require_env_var ANYSCALE_CLOUD_DEPLOYMENT_ID
-
-  local cli_bin compute_config_file create_log start_log wait_log install_log tutorial_log tutorial_command
-  local workspace_created=false workspace_intro_succeeded=false create_output start_output wait_output install_output tutorial_output
-
-  cli_bin="$(anyscale_cli_bin)"
-  mkdir -p "${CACHE_DIR}"
-
-  if [[ -z "${workspace_name}" ]]; then
-    workspace_name="workspace-intro-smoke-$(date +%Y%m%d%H%M%S)"
-  fi
-
-  compute_config_file="${CACHE_DIR}/anyscale-compute.${compute_config_name}.yaml"
-  create_log="${CACHE_DIR}/${workspace_name}.create.log"
-  start_log="${CACHE_DIR}/${workspace_name}.start.log"
-  wait_log="${CACHE_DIR}/${workspace_name}.wait.log"
-  install_log="${CACHE_DIR}/${workspace_name}.install.log"
-  tutorial_log="${CACHE_DIR}/${workspace_name}.tutorial.log"
-
-  workspace_intro_cleanup() {
-    if [[ "${workspace_created}" != true ]]; then
-      return 0
-    fi
-
-    if [[ "${keep_workspace}" == true ]]; then
-      return 0
-    fi
-
-    if [[ "${workspace_intro_succeeded}" != true ]]; then
-      warn "Keeping workspace ${workspace_name} for debugging because the smoke test did not complete successfully. Rerun with --keep-workspace if you want to make that intent explicit."
-      return 0
-    fi
-
-    warn "Terminating workspace ${workspace_name}"
-    run_with_timeout "${SETUP_TIMEOUT_ANYSCALE_COMMAND_SECONDS}" \
-      "${cli_bin}" workspace_v2 terminate \
-        --name "${workspace_name}" \
-        --cloud "${ANYSCALE_CLOUD_NAME}" >/dev/null 2>&1 || \
-      warn "Failed to terminate workspace ${workspace_name}. Terminate it manually from the Anyscale console if it remains active."
-  }
-
-  trap workspace_intro_cleanup EXIT
-
-  anyscale_workspace_ready
-  validate_anyscale_operator_patches
-  ensure_anyscale_compute_config "${compute_config_name}" "${cli_bin}" "${compute_config_file}" "mixed"
-
-  log "Creating workspace ${workspace_name} for the Intro to Workspaces smoke test"
-  local create_status=0
-  if ! create_output="$(run_with_timeout "${SETUP_TIMEOUT_ANYSCALE_COMMAND_SECONDS}" \
-    "${cli_bin}" workspace_v2 create \
-      --name "${workspace_name}" \
-      --compute-config "${compute_config_name}" \
-      --cloud "${ANYSCALE_CLOUD_NAME}" \
-      --env "MY_EMOJI=:thumbs_up:" 2>&1)"; then
-    create_status=$?
-  fi
-  printf '%s\n' "${create_output}" | tee "${create_log}"
-  if [[ "${create_status}" -ne 0 ]] && ! grep -q 'Workspace created successfully id:' <<<"${create_output}"; then
-    printf '%s\n' "${create_output}" | tee "${create_log}"
-    die "The workspace create step failed. See ${create_log}."
-  fi
-  if [[ "${create_status}" -ne 0 ]]; then
-    warn "The Anyscale CLI did not exit cleanly after reporting workspace creation; continuing with explicit workspace_v2 wait."
-  fi
-  workspace_created=true
-
-  log "Starting workspace ${workspace_name}"
-  if ! start_output="$(run_with_timeout "${SETUP_TIMEOUT_ANYSCALE_COMMAND_SECONDS}" \
-    "${cli_bin}" workspace_v2 start \
-      --name "${workspace_name}" \
-      --cloud "${ANYSCALE_CLOUD_NAME}" 2>&1)"; then
-    printf '%s\n' "${start_output}" | tee "${start_log}"
-    die "The workspace start step failed. See ${start_log}."
-  fi
-  printf '%s\n' "${start_output}" | tee "${start_log}"
-
-  log "Waiting for workspace ${workspace_name} to reach RUNNING"
-  if ! wait_for_anyscale_workspace_running "${workspace_name}" "${cli_bin}" "${wait_log}"; then
-    wait_output="${ANYSCALE_WORKSPACE_WAIT_RESULT}"
-    printf '%s\n' "${wait_output}" | tee -a "${wait_log}"
-    die "The workspace did not reach RUNNING. See ${wait_log}."
-  fi
-  wait_output="${ANYSCALE_WORKSPACE_WAIT_RESULT}"
-  printf '%s\n' "${wait_output}" | tee -a "${wait_log}"
-
-  log "Installing emoji in workspace ${workspace_name} through the Bastion-backed head pod"
-  if ! install_output="$(workspace_exec_head_bash "${workspace_name}" 'python -m pip install emoji' 2>&1)"; then
-    printf '%s\n' "${install_output}" | tee "${install_log}"
-    die "The tutorial dependency-install step failed. See ${install_log}."
-  fi
-  printf '%s\n' "${install_output}" | tee "${install_log}"
-
-  tutorial_command="$(cat <<'EOF'
-python - <<'PY'
-import os
-import ray
-
-if ray.is_initialized():
-    ray.shutdown()
-
-ray.init(address="auto")
-
-@ray.remote
-def render_intro_message():
-    import emoji
-
-    my_emoji = os.environ.get("MY_EMOJI", ":thumbs_up:")
-    return emoji.emojize(f"Dependencies are {my_emoji}")
-
-print(ray.get(render_intro_message.remote()))
-print("WORKSPACE_INTRO_SMOKE_OK")
-PY
-EOF
-)"
-
-  log "Running the Intro to Workspaces Ray smoke command in ${workspace_name} through the Bastion-backed head pod"
-  if ! tutorial_output="$(workspace_exec_head_bash "${workspace_name}" "${tutorial_command}" 2>&1)"; then
-    printf '%s\n' "${tutorial_output}" | tee "${tutorial_log}"
-    die "The workspace tutorial smoke command failed. See ${tutorial_log}."
-  fi
-  printf '%s\n' "${tutorial_output}" | tee "${tutorial_log}"
-
-  grep -q 'WORKSPACE_INTRO_SMOKE_OK' <<<"${tutorial_output}" || die "The workspace tutorial smoke command completed without the expected success marker. See ${tutorial_log}."
-
-  workspace_intro_succeeded=true
-  log "Workspace intro smoke completed successfully. Logs: ${install_log}, ${tutorial_log}"
-
-  if [[ "${keep_workspace}" == true ]]; then
-    trap - EXIT
-    log "Keeping workspace ${workspace_name} running for follow-up debugging."
-  fi
-}
-
-workspace_compute_ready() {
-  local cpu_workspace_name="workspace-cpu-ready"
-  local gpu_workspace_name="workspace-gpu-ready"
-  local cpu_compute_config_name="aks-cpu-only"
-  local gpu_compute_config_name="aks-gpu-only"
-  local terminate_workspaces=false
+anyscale_workspaces_register() {
+  local cpu_workspace_name="aks-cpu-workspace"
+  local gpu_workspace_name="aks-gpu-workspace"
+  local cpu_compute_config_name="aks-cpu"
+  local gpu_compute_config_name="aks-gpu"
 
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -2463,26 +2280,23 @@ workspace_compute_ready() {
         gpu_compute_config_name="$2"
         shift 2
         ;;
-      --terminate-workspaces)
-        terminate_workspaces=true
-        shift
-        ;;
       --help|-h)
         cat <<'USAGE'
 Usage:
-  ./scripts/setup.sh workspace-compute-ready
-  ./scripts/setup.sh workspace-compute-ready --terminate-workspaces
-  ./scripts/setup.sh workspace-compute-ready --cpu-workspace-name my-cpu --gpu-workspace-name my-gpu
+  ./scripts/setup.sh anyscale-workspaces-register
+  ./scripts/setup.sh anyscale-workspaces-register --cpu-workspace-name my-cpu --gpu-workspace-name my-gpu
 
-Creates or reuses dedicated CPU and GPU compute configs, creates or starts
-dedicated workspaces for each node pool, validates each workspace from the
-private Bastion-backed kubeconfig path, and leaves the workspaces running by
-default so they are ready to use through the Anyscale CLI.
+Idempotently registers dedicated CPU and GPU compute configs and matching
+workspaces against the Azure-hosted Anyscale control plane. The CPU workspace
+is started and validated structurally (head pod scheduled on the CPU pool).
+The GPU workspace is registered only; start it manually from the Anyscale
+console when you want to consume GPU capacity. Existing compute configs and
+workspaces with the same names are reused.
 USAGE
         return 0
         ;;
       *)
-        die "Unknown workspace-compute-ready option: $1"
+        die "Unknown anyscale-workspaces-register option: $1"
         ;;
     esac
   done
@@ -2498,9 +2312,8 @@ USAGE
   local cli_bin namespace
   local cpu_compute_config_file gpu_compute_config_file
   local cpu_create_log cpu_start_log cpu_wait_log cpu_validate_log
-  local gpu_create_log gpu_start_log gpu_wait_log gpu_validate_log
-  local cpu_head_pod gpu_head_pod cpu_node_name gpu_node_name
-  local cpu_validation_command gpu_validation_command
+  local gpu_create_log
+  local cpu_head_pod cpu_node_name
 
   cli_bin="$(anyscale_cli_bin)"
   namespace="${TF_VAR_anyscale_operator_namespace}"
@@ -2513,78 +2326,33 @@ USAGE
   cpu_wait_log="${CACHE_DIR}/${cpu_workspace_name}.wait.log"
   cpu_validate_log="${CACHE_DIR}/${cpu_workspace_name}.validate.log"
   gpu_create_log="${CACHE_DIR}/${gpu_workspace_name}.create.log"
-  gpu_start_log="${CACHE_DIR}/${gpu_workspace_name}.start.log"
-  gpu_wait_log="${CACHE_DIR}/${gpu_workspace_name}.wait.log"
-  gpu_validate_log="${CACHE_DIR}/${gpu_workspace_name}.validate.log"
 
-  ensure_named_workspace_running() {
+  ensure_registered_workspace() {
     local workspace_name="$1"
     local compute_config_name="$2"
     local create_log="$3"
-    local start_log="$4"
-    local wait_log="$5"
-    local status_output current_status create_output start_output
-    local create_status=0
+    local create_output create_status=0
 
-    if status_output="$(run_with_timeout "${SETUP_TIMEOUT_ANYSCALE_COMMAND_SECONDS}" \
+    if run_with_timeout "${SETUP_TIMEOUT_ANYSCALE_COMMAND_SECONDS}" \
       "${cli_bin}" workspace_v2 status \
         --name "${workspace_name}" \
-        --cloud "${ANYSCALE_CLOUD_NAME}" 2>&1)"; then
-      current_status="$(normalize_anyscale_workspace_status "${status_output}")"
-      printf '%s\n' "${status_output}" > "${wait_log}"
-
-      case "${current_status}" in
-        RUNNING)
-          log "Workspace ${workspace_name} is already RUNNING"
-          return 0
-          ;;
-        STARTING)
-          log "Waiting for existing workspace ${workspace_name} to reach RUNNING"
-          if ! wait_for_anyscale_workspace_running "${workspace_name}" "${cli_bin}" "${wait_log}"; then
-            printf '%s\n' "${ANYSCALE_WORKSPACE_WAIT_RESULT}" | tee -a "${wait_log}"
-            die "The workspace ${workspace_name} did not reach RUNNING. See ${wait_log}."
-          fi
-          printf '%s\n' "${ANYSCALE_WORKSPACE_WAIT_RESULT}" | tee -a "${wait_log}"
-          return 0
-          ;;
-      esac
-    else
-      log "Creating workspace ${workspace_name} with compute config ${compute_config_name}"
-      if ! create_output="$(run_with_timeout "${SETUP_TIMEOUT_ANYSCALE_COMMAND_SECONDS}" \
-        "${cli_bin}" workspace_v2 create \
-          --name "${workspace_name}" \
-          --compute-config "${compute_config_name}" \
-          --cloud "${ANYSCALE_CLOUD_NAME}" 2>&1)"; then
-        create_status=$?
-      fi
-      printf '%s\n' "${create_output}" | tee "${create_log}"
-      if [[ "${create_status}" -ne 0 ]] && ! grep -q 'Workspace created successfully id:' <<<"${create_output}"; then
-        die "The workspace create step failed for ${workspace_name}. See ${create_log}."
-      fi
-      if [[ "${create_status}" -ne 0 ]]; then
-        warn "The Anyscale CLI did not exit cleanly after reporting workspace creation for ${workspace_name}; continuing with explicit start and wait."
-      fi
+        --cloud "${ANYSCALE_CLOUD_NAME}" >/dev/null 2>&1; then
+      log "Workspace ${workspace_name} already registered (compute-config ${compute_config_name})"
+      return 0
     fi
 
-    log "Starting workspace ${workspace_name}"
-    if ! start_output="$(run_with_timeout "${SETUP_TIMEOUT_ANYSCALE_COMMAND_SECONDS}" \
-      "${cli_bin}" workspace_v2 start \
+    log "Registering workspace ${workspace_name} with compute config ${compute_config_name}"
+    if ! create_output="$(run_with_timeout "${SETUP_TIMEOUT_ANYSCALE_COMMAND_SECONDS}" \
+      "${cli_bin}" workspace_v2 create \
         --name "${workspace_name}" \
+        --compute-config "${compute_config_name}" \
         --cloud "${ANYSCALE_CLOUD_NAME}" 2>&1)"; then
-      printf '%s\n' "${start_output}" | tee "${start_log}"
-      if ! grep -Eiq 'already.*running|currently in state: STARTING' <<<"${start_output}"; then
-        die "The workspace start step failed for ${workspace_name}. See ${start_log}."
-      fi
-    else
-      printf '%s\n' "${start_output}" | tee "${start_log}"
+      create_status=$?
     fi
-
-    log "Waiting for workspace ${workspace_name} to reach RUNNING"
-    if ! wait_for_anyscale_workspace_running "${workspace_name}" "${cli_bin}" "${wait_log}"; then
-      printf '%s\n' "${ANYSCALE_WORKSPACE_WAIT_RESULT}" | tee -a "${wait_log}"
-      die "The workspace ${workspace_name} did not reach RUNNING. See ${wait_log}."
+    printf '%s\n' "${create_output}" | tee "${create_log}"
+    if [[ "${create_status}" -ne 0 ]] && ! grep -q 'Workspace created successfully id:' <<<"${create_output}"; then
+      die "The workspace create step failed for ${workspace_name}. See ${create_log}."
     fi
-    printf '%s\n' "${ANYSCALE_WORKSPACE_WAIT_RESULT}" | tee -a "${wait_log}"
   }
 
   anyscale_workspace_ready
@@ -2592,25 +2360,32 @@ USAGE
   ensure_anyscale_compute_config "${cpu_compute_config_name}" "${cli_bin}" "${cpu_compute_config_file}" "cpu"
   ensure_anyscale_compute_config "${gpu_compute_config_name}" "${cli_bin}" "${gpu_compute_config_file}" "gpu"
 
-  ensure_named_workspace_running "${cpu_workspace_name}" "${cpu_compute_config_name}" "${cpu_create_log}" "${cpu_start_log}" "${cpu_wait_log}"
-  ensure_named_workspace_running "${gpu_workspace_name}" "${gpu_compute_config_name}" "${gpu_create_log}" "${gpu_start_log}" "${gpu_wait_log}"
+  ensure_registered_workspace "${cpu_workspace_name}" "${cpu_compute_config_name}" "${cpu_create_log}"
+  ensure_registered_workspace "${gpu_workspace_name}" "${gpu_compute_config_name}" "${gpu_create_log}"
+
+  log "Starting CPU workspace ${cpu_workspace_name} for structural validation"
+  local start_output
+  if ! start_output="$(run_with_timeout "${SETUP_TIMEOUT_ANYSCALE_COMMAND_SECONDS}" \
+    "${cli_bin}" workspace_v2 start \
+      --name "${cpu_workspace_name}" \
+      --cloud "${ANYSCALE_CLOUD_NAME}" 2>&1)"; then
+    printf '%s\n' "${start_output}" | tee "${cpu_start_log}"
+    if ! grep -Eiq 'already.*running|currently in state: STARTING' <<<"${start_output}"; then
+      die "The workspace start step failed for ${cpu_workspace_name}. See ${cpu_start_log}."
+    fi
+  else
+    printf '%s\n' "${start_output}" | tee "${cpu_start_log}"
+  fi
+
+  log "Waiting for ${cpu_workspace_name} to reach RUNNING"
+  if ! wait_for_anyscale_workspace_running "${cpu_workspace_name}" "${cli_bin}" "${cpu_wait_log}"; then
+    printf '%s\n' "${ANYSCALE_WORKSPACE_WAIT_RESULT}" | tee -a "${cpu_wait_log}"
+    die "${cpu_workspace_name} did not reach RUNNING. See ${cpu_wait_log}."
+  fi
+  printf '%s\n' "${ANYSCALE_WORKSPACE_WAIT_RESULT}" | tee -a "${cpu_wait_log}"
 
   cpu_head_pod="$(workspace_head_pod_name "${cpu_workspace_name}")"
   cpu_node_name="$(kubectl get pod -n "${namespace}" "${cpu_head_pod}" -o jsonpath='{.spec.nodeName}')"
-  cpu_validation_command="$(cat <<'EOF'
-python - <<'PY'
-import ray
-
-ray.init(address="auto")
-
-@ray.remote(num_cpus=1)
-def cpu_probe():
-    return "CPU_WORKSPACE_OK"
-
-print(ray.get(cpu_probe.remote()))
-PY
-EOF
-)"
 
   {
     printf 'workspace=%s\n' "${cpu_workspace_name}"
@@ -2618,65 +2393,14 @@ EOF
     printf 'head_pod=%s\n' "${cpu_head_pod}"
     printf 'node=%s\n' "${cpu_node_name}"
     kubectl get pod -n "${namespace}" "${cpu_head_pod}" -o wide
-    workspace_exec_head_bash "${cpu_workspace_name}" "${cpu_validation_command}"
   } 2>&1 | tee "${cpu_validate_log}"
 
-  [[ "${cpu_node_name}" == aks-cpu-* ]] || die "CPU workspace ${cpu_workspace_name} is running on unexpected node ${cpu_node_name}. See ${cpu_validate_log}."
-  grep -q 'CPU_WORKSPACE_OK' "${cpu_validate_log}" || die "CPU workspace validation did not emit the expected success marker. See ${cpu_validate_log}."
+  [[ "${cpu_node_name}" == aks-cpu-* ]] || die "CPU workspace ${cpu_workspace_name} head pod is running on unexpected node ${cpu_node_name}. See ${cpu_validate_log}."
 
-  gpu_head_pod="$(workspace_head_pod_name "${gpu_workspace_name}")"
-  gpu_node_name="$(kubectl get pod -n "${namespace}" "${gpu_head_pod}" -o jsonpath='{.spec.nodeName}')"
-  gpu_validation_command="$(cat <<'EOF'
-nvidia-smi -L
-python - <<'PY'
-import ray
-
-ray.init(address="auto")
-
-@ray.remote(num_gpus=1)
-def gpu_probe():
-    import os
-
-    return f"GPU_WORKSPACE_OK:{os.environ.get('CUDA_VISIBLE_DEVICES', 'none')}"
-
-print(ray.get(gpu_probe.remote()))
-PY
-EOF
-)"
-
-  {
-    printf 'workspace=%s\n' "${gpu_workspace_name}"
-    printf 'compute_config=%s\n' "${gpu_compute_config_name}"
-    printf 'head_pod=%s\n' "${gpu_head_pod}"
-    printf 'node=%s\n' "${gpu_node_name}"
-    kubectl get pod -n "${namespace}" "${gpu_head_pod}" -o wide
-    workspace_exec_head_bash "${gpu_workspace_name}" "${gpu_validation_command}"
-  } 2>&1 | tee "${gpu_validate_log}"
-
-  [[ "${gpu_node_name}" == aks-gput4-* ]] || die "GPU workspace ${gpu_workspace_name} is running on unexpected node ${gpu_node_name}. See ${gpu_validate_log}."
-  grep -q 'GPU 0:' "${gpu_validate_log}" || die "GPU workspace validation did not observe a GPU device. See ${gpu_validate_log}."
-  grep -Eq 'GPU_WORKSPACE_OK:[0-9]+' "${gpu_validate_log}" || die "GPU workspace validation did not emit the expected success marker. See ${gpu_validate_log}."
-
-  log "Dedicated CPU and GPU workspaces are ready to use through the Anyscale CLI."
-  log "CPU workspace: ${cpu_workspace_name} (${cpu_compute_config_name})"
-  log "GPU workspace: ${gpu_workspace_name} (${gpu_compute_config_name})"
-  log "Validation logs: ${cpu_validate_log}, ${gpu_validate_log}"
-
-  if [[ "${terminate_workspaces}" == true ]]; then
-    warn "Terminating workspace ${cpu_workspace_name}"
-    run_with_timeout "${SETUP_TIMEOUT_ANYSCALE_COMMAND_SECONDS}" \
-      "${cli_bin}" workspace_v2 terminate \
-        --name "${cpu_workspace_name}" \
-        --cloud "${ANYSCALE_CLOUD_NAME}" >/dev/null 2>&1 || \
-      warn "Failed to terminate workspace ${cpu_workspace_name}."
-
-    warn "Terminating workspace ${gpu_workspace_name}"
-    run_with_timeout "${SETUP_TIMEOUT_ANYSCALE_COMMAND_SECONDS}" \
-      "${cli_bin}" workspace_v2 terminate \
-        --name "${gpu_workspace_name}" \
-        --cloud "${ANYSCALE_CLOUD_NAME}" >/dev/null 2>&1 || \
-      warn "Failed to terminate workspace ${gpu_workspace_name}."
-  fi
+  log "CPU workspace ${cpu_workspace_name} is RUNNING on the CPU node pool (compute-config ${cpu_compute_config_name})."
+  log "GPU workspace ${gpu_workspace_name} registered with compute-config ${gpu_compute_config_name}. Start it manually from the Anyscale console when ready."
+  log "Run the Ray CPU/GPU runtime probes from the workspace console or terminal as documented in the README."
+  log "Logs: ${cpu_create_log}, ${cpu_start_log}, ${cpu_wait_log}, ${cpu_validate_log}, ${gpu_create_log}"
 }
 
 ###############################################################################
@@ -2684,8 +2408,7 @@ post() {
   log "Kubernetes bootstrap is Terraform-managed. Re-run terraform apply to reconcile the operator service account, NVIDIA device plugin, and ingress-nginx releases."
   log "If the current shell already has a Bastion-backed kubeconfig and ANYSCALE_CLI_TOKEN, ./scripts/setup.sh apply now auto-runs ./scripts/setup.sh anyscale-workspace-ready after Terraform finishes."
   log "Otherwise, rerun ./scripts/setup.sh anyscale-workspace-ready to inject the Azure CLI token and AKS-aligned CPU/GPU instance types into the operator release."
-  log "Use ./scripts/setup.sh workspace-intro-smoke to run the Azure-hosted Anyscale tutorial smoke after the operator patch is in place."
-  log "Use ./scripts/setup.sh workspace-compute-ready to create or reuse dedicated CPU and GPU workspaces and leave them running for CLI use."
+  log "Use ./scripts/setup.sh anyscale-workspaces-register to register the aks-cpu and aks-gpu compute configs plus the aks-cpu-workspace and aks-gpu-workspace workspaces; the CPU workspace is started and validated, the GPU workspace is registered only."
   warn "For a Bastion-backed local workflow, export TF_VAR_cluster_bootstrap with the Bastion kubeconfig path before re-running terraform apply."
 }
 
@@ -2791,8 +2514,7 @@ case "${cmd}" in
   kubeconfig) kubeconfig ;;
   kubeconfig-bastion) shift; kubeconfig_bastion "$@" ;;
   anyscale-workspace-ready) shift; anyscale_workspace_ready "$@" ;;
-  workspace-intro-smoke) shift; workspace_intro_smoke "$@" ;;
-  workspace-compute-ready) shift; workspace_compute_ready "$@" ;;
+  anyscale-workspaces-register) shift; anyscale_workspaces_register "$@" ;;
   post)       post ;;
   control-plane-egress-smoke) control_plane_egress_smoke ;;
   validate-focused) shift; validate_focused "$@" ;;
@@ -2803,5 +2525,5 @@ case "${cmd}" in
   destroy)    destroy ;;
   nuke)       shift; nuke "$@" ;;
   all)        preflight; tf_init; validate; plan; apply; outputs ;;
-  *) die "Usage: $0 {preflight|tfvars|init|validate|plan|apply|outputs|bastion|bastion-tunnel|kubeconfig|kubeconfig-bastion|anyscale-workspace-ready|workspace-intro-smoke|post|control-plane-egress-smoke|validate-focused|validate-k8s|validate-observability|functional-test|status|destroy|nuke|all}" ;;
+  *) die "Usage: $0 {preflight|tfvars|init|validate|plan|apply|outputs|bastion|bastion-tunnel|kubeconfig|kubeconfig-bastion|anyscale-workspace-ready|anyscale-workspaces-register|post|control-plane-egress-smoke|validate-focused|validate-k8s|validate-observability|functional-test|status|destroy|nuke|all}" ;;
 esac
