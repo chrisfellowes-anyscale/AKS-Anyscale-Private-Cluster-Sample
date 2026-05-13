@@ -6,15 +6,16 @@
 #   terraform test -filter=tests/apply.tftest.hcl -verbose
 #
 # Cost note: this provisions an Azure Firewall (Standard) which is billed by
-# the hour. Expect a ~20 minute runtime per cycle.
+# the hour. GPU pool contract coverage lives in the plan suites so this apply
+# test can stay quota-safe in subscriptions without NCASv3 capacity.
 ###############################################################################
 
 variables {
   azure_subscription_id = "24a4c592-bfaf-492f-beaf-f10b3b67f03f"
   azure_tenant_id       = "6f070e41-8d1e-45c9-af17-551c9b98860d"
 
-  project        = "myproject"
-  environment    = "dev"
+  project        = "tftest"
+  environment    = "ci"
   azure_location = "westus3"
   region_short   = "wus3"
 
@@ -71,18 +72,9 @@ variables {
     "prod-registry-k8s-io-us-west-1.s3.dualstack.us-west-1.amazonaws.com",
   ]
 
-  system_vm_size = "Standard_D2s_v5"
-  cpu_vm_size    = "Standard_D16s_v5"
-  gpu_pool_configs = {
-    T4 = {
-      name         = "gput4"
-      vm_size      = "Standard_NC16as_T4_v3"
-      product_name = "NVIDIA-T4"
-      gpu_count    = "1"
-      min_count    = 1
-      max_count    = 2
-    }
-  }
+  system_vm_size   = "Standard_D2s_v5"
+  cpu_vm_size      = "Standard_D16s_v5"
+  gpu_pool_configs = {}
 
   kubernetes_version               = "1.34.6"
   service_cidr                     = "10.100.0.0/16"
@@ -106,8 +98,8 @@ variables {
   log_analytics_retention_days                  = 30
   terraform_managed_diagnostic_settings_enabled = true
   tags = {
-    Project     = "myproject"
-    Environment = "dev"
+    Project     = "tftest"
+    Environment = "ci"
     ManagedBy   = "terraform"
     Owner       = "terraform-test"
   }
@@ -117,7 +109,7 @@ run "phase1_apply" {
   command = apply
 
   assert {
-    condition     = output.resource_group_name == "rg-myproject-dev-wus3"
+    condition     = output.resource_group_name == "rg-tftest-ci-wus3"
     error_message = "Resource group name does not match the CAF naming convention."
   }
 

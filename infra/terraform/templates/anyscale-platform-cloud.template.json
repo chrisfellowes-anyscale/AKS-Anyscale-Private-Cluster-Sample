@@ -14,40 +14,6 @@
         "description": "The name of the Anyscale cloud."
       }
     },
-    "aksClusterResourceId": {
-      "type": "string",
-      "metadata": {
-        "description": "The full resource ID of the AKS cluster where the operator will be installed."
-      }
-    },
-    "extensionResourceName": {
-      "type": "string",
-      "defaultValue": "anyscaleoperator",
-      "metadata": {
-        "description": "The name for the Kubernetes extension resource."
-      }
-    },
-    "controlPlaneUrl": {
-      "type": "string",
-      "defaultValue": "https://console.azure.anyscale.com",
-      "metadata": {
-        "description": "The Anyscale control plane URL."
-      }
-    },
-    "authAudience": {
-      "type": "string",
-      "defaultValue": "api://086bc555-6989-4362-ba30-fded273e432b/.default",
-      "metadata": {
-        "description": "The Azure AD audience for authentication (format: api://GUID/.default)."
-      }
-    },
-    "extensionConfigurationSettings": {
-      "type": "object",
-      "defaultValue": {},
-      "metadata": {
-        "description": "Additional Helm-style configurationSettings entries passed to the AKS extension."
-      }
-    },
     "storageAccountName": {
       "type": "string",
       "metadata": {
@@ -101,34 +67,6 @@
       "defaultValue": "",
       "metadata": {
         "description": "The full resource ID of an existing managed identity (only for 'existing' mode)."
-      }
-    },
-    "planName": {
-      "type": "string",
-      "defaultValue": "anyscale-operator",
-      "metadata": {
-        "description": "Marketplace plan name."
-      }
-    },
-    "planPublisher": {
-      "type": "string",
-      "defaultValue": "anyscale1750870039553",
-      "metadata": {
-        "description": "Marketplace plan publisher."
-      }
-    },
-    "planProduct": {
-      "type": "string",
-      "defaultValue": "anyscale-operator-aks",
-      "metadata": {
-        "description": "Marketplace plan product/offer ID."
-      }
-    },
-    "releaseTrain": {
-      "type": "string",
-      "defaultValue": "stable",
-      "metadata": {
-        "description": "The release train for the AKS extension."
       }
     },
     "tagsByResource": {
@@ -205,20 +143,11 @@
       "metadata": {
         "description": "The name for the ACR role assignments nested deployment."
       }
-    },
-    "aksExtensionDeploymentName": {
-      "type": "string",
-      "defaultValue": "[concat('AksExtensionDeployment-', utcNow('yyyyMMddHHmmss'))]",
-      "metadata": {
-        "description": "The name for the AKS extension nested deployment."
-      }
     }
   },
   "variables": {
     "containerName": "[parameters('storageContainerName')]",
     "storageBlobDataOwnerRoleId": "b7e6dc6d-f1e8-4753-8033-0f276bb0955b",
-    "kubernetesServiceAccountNamespace": "anyscale-operator",
-    "kubernetesServiceAccountName": "anyscale-operator",
     "abfssUrl": "[concat('abfss://', variables('containerName'), '@', parameters('storageAccountName'), '.dfs.core.windows.net')]",
     "blobEndpoint": "[concat('https://', parameters('storageAccountName'), '.blob.core.windows.net')]",
     "effectiveStorageResourceId": "[if(equals(parameters('storageMode'), 'managed'), resourceId('Microsoft.Storage/storageAccounts', parameters('storageAccountName')), parameters('storageAccountResourceId'))]",
@@ -231,7 +160,6 @@
     "acrTaskContributorRoleId": "fb382eab-e894-4461-af04-94435c366c3f",
     "acrPullRoleId": "7f951dda-4ed3-4680-a7ca-43fe172d538d",
     "acrResourceId": "[if(equals(parameters('acrMode'), 'managed'), resourceId('Microsoft.ContainerRegistry/registries', variables('acrSafeName')), if(equals(parameters('acrMode'), 'existing'), parameters('acrResourceId'), ''))]",
-    "aksResourceGroup": "[split(parameters('aksClusterResourceId'), '/')[4]]",
     "acrResourceGroup": "[if(not(equals(parameters('acrMode'), 'none')), split(variables('acrResourceId'), '/')[4], '')]"
   },
   "resources": [
@@ -462,42 +390,6 @@
         "anyscaleOperatorIamIdentity": "[reference(variables('effectiveIdentityResourceId'), '2023-01-31').principalId]"
       },
       "tags": "[union(if(contains(parameters('tagsByResource'), 'Anyscale.Platform/clouds/cloudResources'), parameters('tagsByResource')['Anyscale.Platform/clouds/cloudResources'], json('{}')), createObject('anyscale-cloud', parameters('cloudName')))]"
-    },
-    {
-      "type": "Microsoft.Resources/deployments",
-      "apiVersion": "2022-09-01",
-      "name": "[parameters('aksExtensionDeploymentName')]",
-      "resourceGroup": "[variables('aksResourceGroup')]",
-      "dependsOn": [
-        "[resourceId('Anyscale.Platform/clouds/cloudResources', parameters('cloudName'), 'default')]",
-        "[parameters('federatedIdentityDeploymentName')]"
-      ],
-      "properties": {
-        "mode": "Incremental",
-        "template": {
-          "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
-          "contentVersion": "1.0.0.0",
-          "resources": [
-            {
-              "type": "Microsoft.KubernetesConfiguration/extensions",
-              "apiVersion": "2023-05-01",
-              "name": "[parameters('extensionResourceName')]",
-              "scope": "[parameters('aksClusterResourceId')]",
-              "plan": {
-                "name": "[parameters('planName')]",
-                "publisher": "[parameters('planPublisher')]",
-                "product": "[parameters('planProduct')]"
-              },
-              "properties": {
-                "extensionType": "Anyscale.AKS.Operator",
-                "autoUpgradeMinorVersion": true,
-                "releaseTrain": "[parameters('releaseTrain')]",
-                "configurationSettings": "[union(createObject('global.cloudDeploymentId', reference(resourceId('Anyscale.Platform/clouds/cloudResources', parameters('cloudName'), 'default'), '2026-02-01-preview').cloudResourceId, 'global.controlPlaneURL', parameters('controlPlaneUrl'), 'global.auth.iamIdentity', reference(variables('effectiveIdentityResourceId'), '2023-01-31').clientId, 'global.auth.audience', parameters('authAudience'), 'workloads.serviceAccount.name', variables('kubernetesServiceAccountName')), parameters('extensionConfigurationSettings'))]"
-              }
-            }
-          ]
-        }
-      }
     }
   ],
   "outputs": {

@@ -14,8 +14,8 @@ variables {
   azure_subscription_id = "24a4c592-bfaf-492f-beaf-f10b3b67f03f"
   azure_tenant_id       = "6f070e41-8d1e-45c9-af17-551c9b98860d"
 
-  project        = "myproject"
-  environment    = "dev"
+  project        = "tftest"
+  environment    = "ci"
   azure_location = "westus3"
   region_short   = "wus3"
 
@@ -106,8 +106,8 @@ variables {
 
   log_analytics_retention_days = 30
   tags = {
-    Project     = "myproject"
-    Environment = "dev"
+    Project     = "tftest"
+    Environment = "ci"
     ManagedBy   = "terraform"
     Owner       = "terraform-test"
   }
@@ -117,17 +117,17 @@ run "naming_and_validate_plan" {
   command = plan
 
   assert {
-    condition     = output.resource_group_name == "rg-myproject-dev-wus3"
+    condition     = output.resource_group_name == "rg-tftest-ci-wus3"
     error_message = "Resource group name does not match the CAF naming convention."
   }
 
   assert {
-    condition     = output.aks_cluster_name == "aks-myproject-dev-wus3"
+    condition     = output.aks_cluster_name == "aks-tftest-ci-wus3"
     error_message = "AKS cluster name does not match the CAF naming convention."
   }
 
   assert {
-    condition     = output.bastion_name == "bas-myproject-dev-wus3"
+    condition     = output.bastion_name == "bas-tftest-ci-wus3"
     error_message = "Bastion name does not match the CAF naming convention."
   }
 
@@ -152,8 +152,32 @@ run "naming_and_validate_plan" {
   }
 
   assert {
-    condition     = output.anyscale_platform_contract.extension_configuration_settings["workloads.accelerator.tolerations.default[0].key"] == "node.anyscale.com/accelerator-type" && output.anyscale_platform_contract.extension_configuration_settings["workloads.accelerator.tolerations.default[1].key"] == "nvidia.com/gpu" && output.anyscale_platform_contract.extension_configuration_settings["workloads.accelerator.tolerations.default[1].operator"] == "Exists"
-    error_message = "The Anyscale extension contract must declaratively include both the accelerator-type and nvidia.com/gpu toleration settings for tainted AKS GPU pools."
+    condition     = output.anyscale_platform_contract.cloud_management_mode == "azapi_arm_template" && output.anyscale_platform_contract.extension_management_mode == "azurerm_kubernetes_cluster_extension" && output.anyscale_platform_contract.extension_type == "Anyscale.AKS.Operator" && output.anyscale_platform_contract.extension_release_namespace == "anyscale-operator" && output.anyscale_platform_contract.extension_service_account_name == "anyscale-operator" && contains(output.anyscale_platform_contract.dynamic_configuration_keys, "global.cloudDeploymentId") && output.anyscale_platform_contract.extension_configuration_settings["workloads.accelerator.tolerations.default[0].key"] == "node.anyscale.com/accelerator-type" && output.anyscale_platform_contract.extension_configuration_settings["workloads.accelerator.tolerations.default[1].key"] == "nvidia.com/gpu" && output.anyscale_platform_contract.extension_configuration_settings["workloads.accelerator.tolerations.default[1].operator"] == "Exists"
+    error_message = "The Anyscale contract must keep the cloud on the AzAPI ARM path, move the AKS extension to the native azurerm resource, and declaratively include the taint-toleration defaults for GPU pools."
   }
 
+}
+
+run "anyscale_platform_native_extension_contract" {
+  command = plan
+
+  variables {
+    cluster_bootstrap = {
+      enabled         = true
+      kubeconfig_path = "tests/fixtures/bootstrap.kubeconfig"
+    }
+    anyscale_platform = {
+      enabled = true
+    }
+  }
+
+  assert {
+    condition     = output.cluster_bootstrap_contract.enabled == true && output.cluster_bootstrap_contract.service_account.annotations["meta.helm.sh/release-name"] == "anyscaleoperator"
+    error_message = "Enabling the platform path must keep the Helm-adoptable operator service account contract intact."
+  }
+
+  assert {
+    condition     = output.anyscale_platform_contract.enabled == true && output.anyscale_platform_contract.extension_release_train == "Stable" && output.anyscale_platform_contract.extension_management_mode == "azurerm_kubernetes_cluster_extension"
+    error_message = "The enabled platform contract must normalize the release train for the native azurerm AKS extension resource."
+  }
 }

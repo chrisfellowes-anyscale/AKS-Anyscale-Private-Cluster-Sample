@@ -12,7 +12,7 @@ The editable source for the diagram is `docs/architecture.drawio`. If you change
 
 ## What this deployment creates
 
-Phase 1 creates the Azure foundation: the resource group, VNet, Bastion subnet, AKS API server subnet, AKS node subnet, private endpoint subnet, DNS Private Resolver subnets, Azure Firewall subnets and policy, the private AKS cluster with system, CPU, and GPU pools, the private storage account, the private Premium ACR, the operator managed identity and federated identity wiring, and the observability resources. Phase 2 finishes the Kubernetes side of the deployment by applying the Terraform-managed bootstrap layer through a Bastion-backed kubeconfig and then deploying the Azure-native Anyscale marketplace resources that bind the existing AKS cluster, storage account, registry, and operator identity into the Anyscale platform flow.
+Phase 1 creates the Azure foundation: the resource group, VNet, Bastion subnet, AKS API server subnet, AKS node subnet, private endpoint subnet, DNS Private Resolver subnets, Azure Firewall subnets and policy, the private AKS cluster with system, CPU, and GPU pools, the private storage account, the private Premium ACR, the operator managed identity and federated identity wiring, and the observability resources. Phase 2 finishes the Kubernetes side of the deployment by applying the Terraform-managed bootstrap layer through a Bastion-backed kubeconfig, deploying the Azure-native Anyscale cloud resources through AzAPI, and installing the AKS marketplace extension through the native `azurerm_kubernetes_cluster_extension` resource so the existing AKS cluster, storage account, registry, and operator identity are bound into the Anyscale platform flow.
 
 The result is intentionally opinionated. AKS stays private, the storage account and ACR stay private-only through Private Link, node egress is forced through Azure Firewall, DNS resolution follows the same enterprise path that the firewall enforces, and local Kubernetes access is Bastion-first.
 
@@ -107,9 +107,9 @@ export TF_VAR_anyscale_platform='{"enabled":false}'
 ./scripts/setup.sh outputs
 ```
 
-`preflight` checks the required CLI tools, renders `terraform.auto.tfvars.json`, verifies `az login`, and switches Azure CLI to the subscription named in `.env`. `init` performs `terraform init`. `validate` runs `terraform fmt -check`, `terraform validate`, and the plan-time Terraform tests that assert the private-cluster, identity, firewall, DNS, and observability contracts. The phase-1 `plan` and `apply` then create the Azure side of the deployment without attempting the Bastion-backed bootstrap or the marketplace extension.
+`preflight` checks the required CLI tools, renders `terraform.auto.tfvars.json`, verifies `az login`, and switches Azure CLI to the subscription named in `.env`. `init` performs `terraform init`. `validate` runs `terraform fmt -check`, `terraform validate`, and the plan-time Terraform tests that assert the private-cluster, identity, firewall, DNS, observability, and native-extension contracts. The phase-1 `plan` and `apply` then create the Azure side of the deployment without attempting the Bastion-backed bootstrap, the Anyscale cloud deployment, or the marketplace extension install.
 
-When phase 1 completes successfully, you should have a live resource group, private AKS cluster, Bastion host, Azure Firewall, DNS resolver, private storage and registry, operator identity, and observability resources. What you do not have yet is the Kubernetes bootstrap layer inside the cluster or the Terraform-managed Anyscale platform resources, because both of those belong to phase 2.
+When phase 1 completes successfully, you should have a live resource group, private AKS cluster, Bastion host, Azure Firewall, DNS resolver, private storage and registry, operator identity, and observability resources. What you do not have yet is the Kubernetes bootstrap layer inside the cluster, the Anyscale cloud deployment, or the AKS marketplace extension install, because all three belong to phase 2.
 
 ## Phase 2: connect through Bastion and finish the deployment
 

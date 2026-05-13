@@ -113,12 +113,12 @@ output "anyscale_cloud_resource_id" {
 
 output "anyscale_extension_resource_id" {
   description = "Resource ID of the Terraform-managed AKS Anyscale extension."
-  value       = local.anyscale_platform_enabled ? "${module.aks.cluster_id}/providers/Microsoft.KubernetesConfiguration/extensions/${local.anyscale_platform_extension_name}" : null
+  value       = local.anyscale_platform_enabled ? azurerm_kubernetes_cluster_extension.anyscale_operator[0].id : null
 }
 
 output "anyscale_extension_name" {
   description = "Name of the Terraform-managed AKS Anyscale extension."
-  value       = local.anyscale_platform_enabled ? local.anyscale_platform_extension_name : null
+  value       = local.anyscale_platform_enabled ? azurerm_kubernetes_cluster_extension.anyscale_operator[0].name : null
 }
 
 output "anyscale_platform_contract" {
@@ -126,7 +126,14 @@ output "anyscale_platform_contract" {
   value = {
     enabled                          = local.anyscale_platform_enabled
     cloud_name                       = local.anyscale_platform_cloud_name
+    cloud_management_mode            = "azapi_arm_template"
+    extension_management_mode        = "azurerm_kubernetes_cluster_extension"
+    extension_type                   = "Anyscale.AKS.Operator"
     extension_resource_name          = local.anyscale_platform_extension_name
+    extension_release_namespace      = var.anyscale_operator_namespace
+    extension_service_account_name   = var.anyscale_operator_serviceaccount
+    extension_release_train          = local.anyscale_platform_extension_release_train
+    dynamic_configuration_keys       = local.anyscale_platform_extension_dynamic_configuration_keys
     extension_configuration_settings = local.anyscale_platform_extension_configuration_settings
   }
 }

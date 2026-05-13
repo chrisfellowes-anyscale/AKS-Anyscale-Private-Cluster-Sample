@@ -234,6 +234,7 @@ variable "gpu_pool_configs" {
     GPU node pool config(s). Map key is logical label (e.g. "T4").
     The sample .env is sized for a 32 vCPU NCASv3_T4 family quota in westus3 (max 2 nodes).
     Set availability_zones per pool only when the selected GPU SKU supports zones in the selected region.
+    Use an empty map only for CPU-only or quota-safe validation scenarios.
   EOT
   type = map(object({
     name               = string
@@ -246,8 +247,8 @@ variable "gpu_pool_configs" {
   }))
 
   validation {
-    condition     = length(var.gpu_pool_configs) > 0 && alltrue([for pool in values(var.gpu_pool_configs) : pool.min_count >= 1 && pool.max_count >= pool.min_count && can(regex("^[a-z][a-z0-9]{0,11}$", pool.name))])
-    error_message = "Each GPU pool must have a valid AKS pool name, min_count >= 1, and max_count >= min_count."
+    condition     = alltrue([for pool in values(var.gpu_pool_configs) : pool.min_count >= 1 && pool.max_count >= pool.min_count && can(regex("^[a-z][a-z0-9]{0,11}$", pool.name))])
+    error_message = "Each configured GPU pool must have a valid AKS pool name, min_count >= 1, and max_count >= min_count."
   }
 
   validation {
@@ -347,9 +348,10 @@ variable "anyscale_platform" {
   description = <<-EOT
     Terraform-managed Anyscale-on-Azure deployment settings.
 
-    When enabled, Terraform deploys the Azure-native Anyscale cloud resources
-    and the AKS marketplace extension as the final stack step using AzAPI,
-    wired to the existing AKS cluster, storage account, ACR, and operator UAMI.
+    When enabled, Terraform keeps the Azure-native Anyscale cloud resources on
+    the portal-exported AzAPI/ARM path, but manages the AKS marketplace
+    extension natively with azurerm, wired to the existing AKS cluster,
+    storage account, ACR, and operator UAMI.
   EOT
 
   type = object({

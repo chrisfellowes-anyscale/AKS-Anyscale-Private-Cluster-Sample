@@ -9,8 +9,8 @@ variables {
   azure_subscription_id = "24a4c592-bfaf-492f-beaf-f10b3b67f03f"
   azure_tenant_id       = "6f070e41-8d1e-45c9-af17-551c9b98860d"
 
-  project        = "myproject"
-  environment    = "dev"
+  project        = "tftest"
+  environment    = "ci"
   azure_location = "westus3"
   region_short   = "wus3"
 
@@ -102,8 +102,8 @@ variables {
   log_analytics_retention_days                  = 30
   terraform_managed_diagnostic_settings_enabled = true
   tags = {
-    Project     = "myproject"
-    Environment = "dev"
+    Project     = "tftest"
+    Environment = "ci"
     ManagedBy   = "terraform"
     Owner       = "terraform-test"
   }
