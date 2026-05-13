@@ -6,13 +6,13 @@ variable "location" {
   type = string
 }
 
+variable "tags" {
+  type = map(string)
+}
+
 variable "azure_tenant_id" {
   description = "Microsoft Entra tenant ID used for AKS managed Entra integration."
   type        = string
-}
-
-variable "tags" {
-  type = map(string)
 }
 
 variable "cluster_name" {

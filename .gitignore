@@ -1,4 +1,5 @@
 # Local secrets / credentials
+# Only .env-template is meant to be versioned; every other .env* variant stays local.
 .env
 .env.*
 !.env-template

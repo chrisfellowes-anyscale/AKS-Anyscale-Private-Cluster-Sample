@@ -331,7 +331,7 @@
 
   <rect class="subnet-orange" x="940" y="515" width="140" height="140" rx="8"/>
   <text class="subnet-text" x="958" y="541" fill="#9a3412">Azure Firewall subnet</text>
-  <text class="subnet-text" x="958" y="559" fill="#9a3412">10.50.0.0/26 + mgmt</text>
+  <text class="subnet-text" x="958" y="559" fill="#9a3412">10.50.0.0/26</text>
   <rect class="card card-orange" x="955" y="552" width="110" height="70" rx="8"/>
   <use href="#icon-firewall" x="969" y="569" width="28" height="24"/>
   <text class="card-title" x="1005" y="579">Azure Firewall</text>

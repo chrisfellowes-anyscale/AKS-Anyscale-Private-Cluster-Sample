@@ -89,6 +89,8 @@ run_with_timeout_bash_watchdog() {
   kill "${watchdog_pid}" 2>/dev/null || true
   wait "${watchdog_pid}" 2>/dev/null || true
 
+  # Normalize SIGTERM/SIGKILL exits from the watchdog path to the conventional
+  # timeout exit code so callers can treat every timeout implementation the same.
   if [[ "${exit_code}" -eq 143 || "${exit_code}" -eq 137 ]]; then
     return 124
   fi

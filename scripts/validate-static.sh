@@ -9,6 +9,9 @@ REPORT_ROOT="${CACHE_DIR}/static-validation"
 RUN_ID="$(date -u +"%Y%m%dT%H%M%SZ")"
 REPORT_DIR="${REPORT_ROOT}/${RUN_ID}"
 
+LOG_INFO_PREFIX="static-validate"
+# shellcheck source=./lib/log.sh
+source "${ROOT_DIR}/scripts/lib/log.sh"
 # shellcheck source=./lib/timeout.sh
 source "${ROOT_DIR}/scripts/lib/timeout.sh"
 
@@ -18,11 +21,6 @@ STATIC_TIMEOUT_TERRAFORM_FMT_SECONDS="${STATIC_TIMEOUT_TERRAFORM_FMT_SECONDS:-30
 STATIC_TIMEOUT_TERRAFORM_INIT_SECONDS="${STATIC_TIMEOUT_TERRAFORM_INIT_SECONDS:-900}"
 STATIC_TIMEOUT_TERRAFORM_VALIDATE_SECONDS="${STATIC_TIMEOUT_TERRAFORM_VALIDATE_SECONDS:-600}"
 STATIC_TIMEOUT_TERRAFORM_TEST_SECONDS="${STATIC_TIMEOUT_TERRAFORM_TEST_SECONDS:-1200}"
-
-GREEN='\033[0;32m'; YELLOW='\033[1;33m'; RED='\033[0;31m'; NC='\033[0m'
-log()  { printf "${GREEN}[static-validate]${NC} %s\n" "$*"; }
-warn() { printf "${YELLOW}[warn]${NC} %s\n" "$*"; }
-die()  { printf "${RED}[error]${NC} %s\n" "$*" >&2; exit 1; }
 
 RESULTS=()
 PASS_COUNT=0

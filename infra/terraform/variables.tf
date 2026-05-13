@@ -65,14 +65,13 @@ variable "subnet_cidrs" {
     AKS API server delegated subnet must be at least /28 (Microsoft.ContainerService/managedClusters delegation).
   EOT
   type = object({
-    firewall            = string
-    firewall_management = string
-    bastion             = string
-    aks_apiserver       = string
-    dns_resolver_in     = string
-    dns_resolver_out    = string
-    private_endpoints   = string
-    aks_nodes           = string
+    firewall          = string
+    bastion           = string
+    aks_apiserver     = string
+    dns_resolver_in   = string
+    dns_resolver_out  = string
+    private_endpoints = string
+    aks_nodes         = string
   })
 
   validation {
@@ -81,8 +80,8 @@ variable "subnet_cidrs" {
   }
 
   validation {
-    condition     = tonumber(split("/", var.subnet_cidrs.firewall)[1]) <= 26 && tonumber(split("/", var.subnet_cidrs.firewall_management)[1]) <= 26 && tonumber(split("/", var.subnet_cidrs.bastion)[1]) <= 26 && tonumber(split("/", var.subnet_cidrs.aks_apiserver)[1]) <= 28 && tonumber(split("/", var.subnet_cidrs.dns_resolver_in)[1]) <= 28 && tonumber(split("/", var.subnet_cidrs.dns_resolver_out)[1]) <= 28
-    error_message = "Firewall, Firewall management, and Bastion subnets must be /26 or larger; AKS API server and DNS Private Resolver subnets must be /28 or larger."
+    condition     = tonumber(split("/", var.subnet_cidrs.firewall)[1]) <= 26 && tonumber(split("/", var.subnet_cidrs.bastion)[1]) <= 26 && tonumber(split("/", var.subnet_cidrs.aks_apiserver)[1]) <= 28 && tonumber(split("/", var.subnet_cidrs.dns_resolver_in)[1]) <= 28 && tonumber(split("/", var.subnet_cidrs.dns_resolver_out)[1]) <= 28
+    error_message = "Firewall and Bastion subnets must be /26 or larger; AKS API server and DNS Private Resolver subnets must be /28 or larger."
   }
 }
 

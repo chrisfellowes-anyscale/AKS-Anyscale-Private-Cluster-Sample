@@ -4,15 +4,15 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
+LOG_INFO_PREFIX="timeout-test"
+# shellcheck source=./lib/log.sh
+source "${ROOT_DIR}/scripts/lib/log.sh"
 # shellcheck source=./lib/timeout.sh
 source "${ROOT_DIR}/scripts/lib/timeout.sh"
 
 TIMEOUT_SELF_TEST_SECONDS="${TIMEOUT_SELF_TEST_SECONDS:-2}"
 TIMEOUT_SELF_TEST_GRACE_SECONDS="${TIMEOUT_SELF_TEST_GRACE_SECONDS:-1}"
 TIMEOUT_SELF_TEST_LONG_SLEEP_SECONDS="${TIMEOUT_SELF_TEST_LONG_SLEEP_SECONDS:-30}"
-
-GREEN='\033[0;32m'; RED='\033[0;31m'; NC='\033[0m'
-log() { printf "${GREEN}[timeout-test]${NC} %s\n" "$*"; }
 
 PASS_COUNT=0
 FAIL_COUNT=0

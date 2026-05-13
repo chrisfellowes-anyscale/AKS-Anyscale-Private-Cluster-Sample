@@ -6,6 +6,10 @@ variable "location" {
   type = string
 }
 
+variable "tags" {
+  type = map(string)
+}
+
 variable "name" {
   type = string
 }
@@ -25,8 +29,4 @@ variable "operator_identity" {
 variable "storage_data_scope_id" {
   description = "Storage data-plane scope to grant Storage Blob Data Contributor on. Prefer the default Anyscale storage container for least privilege."
   type        = string
-}
-
-variable "tags" {
-  type = map(string)
 }

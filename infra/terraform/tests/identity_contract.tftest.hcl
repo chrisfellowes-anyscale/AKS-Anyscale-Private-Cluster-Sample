@@ -19,14 +19,13 @@ variables {
 
   vnet_address_space = ["10.50.0.0/16"]
   subnet_cidrs = {
-    firewall            = "10.50.0.0/26"
-    firewall_management = "10.50.0.64/26"
-    bastion             = "10.50.0.128/26"
-    aks_apiserver       = "10.50.1.0/28"
-    dns_resolver_in     = "10.50.1.16/28"
-    dns_resolver_out    = "10.50.1.32/28"
-    private_endpoints   = "10.50.2.0/24"
-    aks_nodes           = "10.50.4.0/22"
+    firewall          = "10.50.0.0/26"
+    bastion           = "10.50.0.128/26"
+    aks_apiserver     = "10.50.1.0/28"
+    dns_resolver_in   = "10.50.1.16/28"
+    dns_resolver_out  = "10.50.1.32/28"
+    private_endpoints = "10.50.2.0/24"
+    aks_nodes         = "10.50.4.0/22"
   }
 
   dns_forwarding_rules = {}

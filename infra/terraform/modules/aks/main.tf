@@ -140,6 +140,8 @@ resource "azurerm_kubernetes_cluster_node_pool" "cpu" {
   tags = var.tags
 
   lifecycle {
+    # AKS mutates node pool upgrade settings during managed upgrade workflows; keep
+    # Terraform from fighting those platform-managed values on later applies.
     ignore_changes = [upgrade_settings]
   }
 }
@@ -176,6 +178,8 @@ resource "azurerm_kubernetes_cluster_node_pool" "gpu" {
   tags = var.tags
 
   lifecycle {
+    # AKS mutates node pool upgrade settings during managed upgrade workflows; keep
+    # Terraform from fighting those platform-managed values on later applies.
     ignore_changes = [upgrade_settings]
   }
 }

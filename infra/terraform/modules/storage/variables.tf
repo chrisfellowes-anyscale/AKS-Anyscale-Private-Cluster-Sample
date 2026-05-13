@@ -6,6 +6,10 @@ variable "location" {
   type = string
 }
 
+variable "tags" {
+  type = map(string)
+}
+
 variable "storage_account_name" {
   type = string
   validation {
@@ -52,10 +56,6 @@ variable "pe_dns_zone_ids" {
     blob = string
     dfs  = string
   })
-}
-
-variable "tags" {
-  type = map(string)
 }
 
 variable "log_analytics_workspace_id" {

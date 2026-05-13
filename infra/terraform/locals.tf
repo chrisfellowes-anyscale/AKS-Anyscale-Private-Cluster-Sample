@@ -15,15 +15,13 @@ locals {
     subnet_dns_resolver_in   = "snet-dnspr-in-${local.suffix}"
     subnet_dns_resolver_out  = "snet-dnspr-out-${local.suffix}"
     # Azure-required fixed names:
-    subnet_firewall            = "AzureFirewallSubnet"
-    subnet_firewall_management = "AzureFirewallManagementSubnet"
-    subnet_bastion             = "AzureBastionSubnet"
+    subnet_firewall = "AzureFirewallSubnet"
+    subnet_bastion  = "AzureBastionSubnet"
 
     nsg_aks_nodes     = "nsg-aks-nodes-${local.suffix}"
     nsg_pe            = "nsg-pe-${local.suffix}"
     route_table_aks   = "rt-aks-${local.suffix}"
     pip_firewall      = "pip-afw-${local.suffix}"
-    pip_firewall_mgmt = "pip-afw-mgmt-${local.suffix}"
     pip_bastion       = "pip-bas-${local.suffix}"
     firewall          = "afw-${local.suffix}"
     firewall_policy   = "afwp-${local.suffix}"
@@ -49,10 +47,8 @@ locals {
   private_dns_zones = {
     blob     = "privatelink.blob.core.windows.net"
     dfs      = "privatelink.dfs.core.windows.net"
-    file     = "privatelink.file.core.windows.net"
     acr      = "privatelink.azurecr.io"
     aks      = "privatelink.${var.azure_location}.azmk8s.io"
-    keyvlt   = "privatelink.vaultcore.azure.net"
     monitor  = "privatelink.monitor.azure.com"
     oms      = "privatelink.oms.opinsights.azure.com"
     ods      = "privatelink.ods.opinsights.azure.com"

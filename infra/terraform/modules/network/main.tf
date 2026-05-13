@@ -13,8 +13,7 @@ resource "azurerm_virtual_network" "this" {
 # Subnets
 # - aks_apiserver subnet must be delegated to Microsoft.ContainerService/managedClusters
 #   Docs: https://learn.microsoft.com/azure/aks/api-server-vnet-integration
-# - AzureFirewallSubnet / AzureFirewallManagementSubnet / AzureBastionSubnet
-#   names are reserved by Azure.
+# - AzureFirewallSubnet / AzureBastionSubnet names are reserved by Azure.
 ###############################################################################
 resource "azurerm_subnet" "aks_nodes" {
   name                 = var.subnet_names.aks_nodes
@@ -81,13 +80,6 @@ resource "azurerm_subnet" "firewall" {
   resource_group_name  = var.resource_group_name
   virtual_network_name = azurerm_virtual_network.this.name
   address_prefixes     = [var.subnet_cidrs.firewall]
-}
-
-resource "azurerm_subnet" "firewall_management" {
-  name                 = var.subnet_names.firewall_management # must be "AzureFirewallManagementSubnet"
-  resource_group_name  = var.resource_group_name
-  virtual_network_name = azurerm_virtual_network.this.name
-  address_prefixes     = [var.subnet_cidrs.firewall_management]
 }
 
 resource "azurerm_subnet" "bastion" {

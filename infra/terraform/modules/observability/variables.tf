@@ -6,6 +6,10 @@ variable "location" {
   type = string
 }
 
+variable "tags" {
+  type = map(string)
+}
+
 variable "log_analytics_name" {
   type = string
 }
@@ -59,8 +63,4 @@ variable "ampls_private_dns_zone_ids" {
     agentsvc = string
     blob     = string
   })
-}
-
-variable "tags" {
-  type = map(string)
 }

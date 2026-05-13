@@ -22,14 +22,13 @@ module "network" {
 
   subnet_cidrs = var.subnet_cidrs
   subnet_names = {
-    aks_nodes           = local.names.subnet_aks_nodes
-    aks_apiserver       = local.names.subnet_aks_apiserver
-    dns_resolver_in     = local.names.subnet_dns_resolver_in
-    dns_resolver_out    = local.names.subnet_dns_resolver_out
-    private_endpoints   = local.names.subnet_private_endpoints
-    firewall            = local.names.subnet_firewall
-    firewall_management = local.names.subnet_firewall_management
-    bastion             = local.names.subnet_bastion
+    aks_nodes         = local.names.subnet_aks_nodes
+    aks_apiserver     = local.names.subnet_aks_apiserver
+    dns_resolver_in   = local.names.subnet_dns_resolver_in
+    dns_resolver_out  = local.names.subnet_dns_resolver_out
+    private_endpoints = local.names.subnet_private_endpoints
+    firewall          = local.names.subnet_firewall
+    bastion           = local.names.subnet_bastion
   }
 
   nsg_aks_nodes_name = local.names.nsg_aks_nodes

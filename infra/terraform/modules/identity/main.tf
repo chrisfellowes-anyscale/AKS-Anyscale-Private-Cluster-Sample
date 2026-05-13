@@ -28,10 +28,12 @@ resource "azurerm_user_assigned_identity" "this" {
 resource "azurerm_role_assignment" "blob_contrib" {
   count = local.manage_storage_rbac ? 1 : 0
 
-  scope                            = var.storage_data_scope_id
-  role_definition_name             = local.storage_role_name
-  principal_id                     = local.identity_principal_id
-  principal_type                   = "ServicePrincipal"
+  scope                = var.storage_data_scope_id
+  role_definition_name = local.storage_role_name
+  principal_id         = local.identity_principal_id
+  principal_type       = "ServicePrincipal"
+  # Workload identity principals can be immediately valid for RBAC even while the
+  # matching service principal object is still replicating through Entra ID.
   skip_service_principal_aad_check = true
   description                      = "Anyscale operator workload identity read/write access to the default storage container."
 }

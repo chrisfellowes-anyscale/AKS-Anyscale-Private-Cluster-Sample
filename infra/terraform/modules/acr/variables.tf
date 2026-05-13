@@ -6,6 +6,10 @@ variable "location" {
   type = string
 }
 
+variable "tags" {
+  type = map(string)
+}
+
 variable "name" {
   type = string
   validation {
@@ -35,8 +39,4 @@ variable "diagnostic_settings_enabled" {
   description = "Whether this module creates Azure Monitor diagnostic settings."
   type        = bool
   default     = false
-}
-
-variable "tags" {
-  type = map(string)
 }

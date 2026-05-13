@@ -9,27 +9,25 @@ variable "vnet_address_space" { type = list(string) }
 
 variable "subnet_cidrs" {
   type = object({
-    firewall            = string
-    firewall_management = string
-    bastion             = string
-    aks_apiserver       = string
-    dns_resolver_in     = string
-    dns_resolver_out    = string
-    private_endpoints   = string
-    aks_nodes           = string
+    firewall          = string
+    bastion           = string
+    aks_apiserver     = string
+    dns_resolver_in   = string
+    dns_resolver_out  = string
+    private_endpoints = string
+    aks_nodes         = string
   })
 }
 
 variable "subnet_names" {
   type = object({
-    aks_nodes           = string
-    aks_apiserver       = string
-    dns_resolver_in     = string
-    dns_resolver_out    = string
-    private_endpoints   = string
-    firewall            = string
-    firewall_management = string
-    bastion             = string
+    aks_nodes         = string
+    aks_apiserver     = string
+    dns_resolver_in   = string
+    dns_resolver_out  = string
+    private_endpoints = string
+    firewall          = string
+    bastion           = string
   })
 }
 
