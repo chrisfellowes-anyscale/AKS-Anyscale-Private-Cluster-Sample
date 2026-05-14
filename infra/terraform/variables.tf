@@ -564,6 +564,12 @@ variable "terraform_managed_diagnostic_settings_enabled" {
   default     = true
 }
 
+variable "storage_diagnostic_settings_enabled" {
+  description = "Whether Terraform creates Azure Monitor diagnostic settings for the storage account and blob service. When null, inherits terraform_managed_diagnostic_settings_enabled."
+  type        = bool
+  default     = null
+}
+
 ###############################################################################
 # Tags
 ###############################################################################

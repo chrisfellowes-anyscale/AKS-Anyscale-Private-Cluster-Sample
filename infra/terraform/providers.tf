@@ -6,7 +6,7 @@ provider "azurerm" {
 }
 
 provider "azapi" {
-  enable_preflight = true
+  subscription_id = var.azure_subscription_id
 }
 
 provider "kubernetes" {
@@ -16,7 +16,4 @@ provider "kubernetes" {
 
 provider "helm" {
   alias = "bootstrap"
-  kubernetes = local.cluster_bootstrap_kubeconfig_path == null ? null : {
-    config_path = local.cluster_bootstrap_kubeconfig_path
-  }
 }

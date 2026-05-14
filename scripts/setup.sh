@@ -9,13 +9,16 @@
 #   ./scripts/setup.sh validate    # fmt + validate + terraform native tests
 #   ./scripts/setup.sh plan        # save tfplan
 #   ./scripts/setup.sh apply       # apply saved plan and auto-run Anyscale post-config when Bastion kubeconfig + token are ready
-#   ./scripts/setup.sh deploy-e2e [--from-scratch --yes|--resume] # guided phase-1 + phase-2 deploy with ANYSCALE_CLI_TOKEN handoff
+#   ./scripts/setup.sh deploy-part1 [--from-scratch --yes] # guided phase-1 + phase-2 deploy that always stops for the manual token handoff
+#   ./scripts/setup.sh deploy-part2 # guided post-token continuation that patches the operator and registers CPU/GPU workspaces
+#   ./scripts/setup.sh deploy-e2e [--from-scratch --yes|--resume] # compatibility wrapper for the older guided pause/resume flow
 #   ./scripts/setup.sh outputs     # print terraform outputs
 #   ./scripts/setup.sh bastion     # open az aks bastion preview tunnel/shell
 #   ./scripts/setup.sh bastion-tunnel start [--port 64430] # run a reusable Bastion tunnel to the private AKS API
 #   ./scripts/setup.sh kubeconfig  # fetch Entra kubeconfig + kubelogin conversion
 #   ./scripts/setup.sh kubeconfig-bastion [--admin] [--export] # write kubeconfig pointed at the Bastion tunnel
 #   ./scripts/setup.sh anyscale-workspace-ready # patch the operator with the Azure CLI token and AKS instance types
+#   ./scripts/setup.sh anyscale-workspace-create --name my-workspace [--compute-config aks-cpu|aks-gpu] [--start] # create an extra workspace through the CLI path
 #   ./scripts/setup.sh anyscale-workspaces-register # register aks-cpu/aks-gpu compute configs and aks-cpu-workspace/aks-gpu-workspace; start+validate CPU only
 #   ./scripts/setup.sh anyscale-workspaces-runtime-proof start-gpu|wait-gpu|gpu-probe|cpu-probe|all # bounded runtime proof steps
 #   ./scripts/setup.sh post        # explain the Terraform-managed Kubernetes bootstrap flow
@@ -98,11 +101,40 @@ set_env_file_var() {
   mv "${tmp_file}" "${ENV_FILE}"
 }
 
+export_kubeconfig_env() {
+  local kubeconfig_path="$1"
+
+  export KUBECONFIG="${kubeconfig_path}"
+  export KUBE_CONFIG_PATH="${kubeconfig_path}"
+}
+
 resource_group_name() {
   printf 'rg-%s-%s-%s\n' \
     "${TF_VAR_project}" \
     "${TF_VAR_environment}" \
     "${TF_VAR_region_short}"
+}
+
+target_aks_cluster_name() {
+  printf 'aks-%s-%s-%s\n' \
+    "${TF_VAR_project}" \
+    "${TF_VAR_environment}" \
+    "${TF_VAR_region_short}"
+}
+
+aks_cluster_exists_for_target() {
+  local resource_group cluster_name
+
+  resource_group="$(resource_group_name)"
+  cluster_name="$(target_aks_cluster_name)"
+
+  run_with_timeout "${SETUP_TIMEOUT_AZURE_COMMAND_SECONDS}" \
+    az aks show \
+      --resource-group "${resource_group}" \
+      --name "${cluster_name}" \
+      --query name \
+      --output tsv \
+      --only-show-errors >/dev/null 2>&1
 }
 
 default_anyscale_host() {
@@ -510,6 +542,14 @@ bastion_admin_kubeconfig_path() {
   harness_state_file "kubeconfig.bastion.admin"
 }
 
+terraform_state_backup_path() {
+  local label="$1"
+  local timestamp
+
+  timestamp="$(date -u +"%Y%m%dT%H%M%SZ")"
+  harness_state_file "terraform.tfstate.${label}.${timestamp}.backup"
+}
+
 pid_from_file() {
   local pid_file="$1"
   [[ -f "${pid_file}" ]] || return 0
@@ -738,6 +778,15 @@ ensure_bastion_extensions() {
   run_with_timeout "${SETUP_TIMEOUT_AZURE_EXTENSION_SECONDS}" az extension add --name bastion --upgrade --yes --only-show-errors >/dev/null 2>&1 || true
 }
 
+ensure_helm_test_repositories() {
+  command -v helm >/dev/null 2>&1 || return 0
+
+  log "Ensuring Helm repositories required by Terraform tests"
+  helm repo add nvdp https://nvidia.github.io/k8s-device-plugin >/dev/null 2>&1 || true
+  helm repo add ingress-nginx https://kubernetes.github.io/ingress-nginx >/dev/null 2>&1 || true
+  run_with_timeout "${SETUP_TIMEOUT_HELM_SECONDS}" helm repo update nvdp ingress-nginx >/dev/null
+}
+
 resolve_aks_context() {
   local field="$1"
   terraform_output_raw "${field}"
@@ -765,10 +814,10 @@ use_bastion_kubeconfig_if_present() {
     && listener_is_ready "${port}"; then
     current_server="$(kubectl config view --minify -o jsonpath='{.clusters[0].cluster.server}' 2>/dev/null || true)"
     if [[ ! "${current_server}" =~ ^https://(127\.0\.0\.1|localhost):[0-9]+/?$ ]]; then
-      export KUBECONFIG="${kubeconfig_file}"
+      export_kubeconfig_env "${kubeconfig_file}"
     fi
   elif [[ -z "${KUBECONFIG:-}" && -f "${kubeconfig_file}" ]]; then
-    export KUBECONFIG="${kubeconfig_file}"
+    export_kubeconfig_env "${kubeconfig_file}"
   fi
 }
 
@@ -818,6 +867,63 @@ anyscale_operator_auth_audience() {
   printf '%s\n' 'api://086bc555-6989-4362-ba30-fded273e432b/.default'
 }
 
+azure_login_command() {
+  local -a cmd=(az login)
+  local command_display
+
+  if [[ -n "${TF_VAR_azure_tenant_id:-}" ]]; then
+    cmd+=(--tenant "${TF_VAR_azure_tenant_id}")
+  fi
+
+  printf -v command_display '%q ' "${cmd[@]}"
+  printf '%s\n' "${command_display% }"
+}
+
+ensure_azure_cli_login() {
+  local az_account_error login_command prompt_response
+
+  if az_account_error="$(az account show --only-show-errors 2>&1 >/dev/null)"; then
+    return 0
+  fi
+
+  login_command="$(azure_login_command)"
+
+  if [[ "${az_account_error}" == *".azure/azureProfile.json"* && "${az_account_error}" == *"Operation not permitted"* ]]; then
+    die "Azure CLI auth context exists, but this shell cannot read ~/.azure/azureProfile.json. Re-run from a terminal with access to your existing az session, or use an unsandboxed shell."
+  fi
+
+  if [[ -t 0 && -t 1 ]]; then
+    warn "Azure CLI is not logged in for this shell."
+    warn "Run ${login_command} in this terminal, then press Enter to retry."
+
+    while true; do
+      printf 'Press Enter after Azure CLI login, or type "abort" to exit: ' >&2
+      IFS= read -r prompt_response || die "Azure CLI login is required. Run: ${login_command}"
+
+      case "${prompt_response}" in
+        "")
+          ;;
+        abort)
+          die "Azure CLI login is required. Run: ${login_command}"
+          ;;
+        *)
+          warn "Unrecognized response '${prompt_response}'. Press Enter after Azure CLI login or type 'abort'."
+          continue
+          ;;
+      esac
+
+      if az account show --only-show-errors >/dev/null 2>&1; then
+        return 0
+      fi
+
+      warn "Azure CLI login is still unavailable in this shell."
+      warn "Run ${login_command} and retry."
+    done
+  fi
+
+  die "Azure CLI login is required. Run: ${login_command}"
+}
+
 ###############################################################################
 preflight() {
   log "Checking required CLI tools..."
@@ -825,7 +931,7 @@ preflight() {
   render_tfvars
 
   log "Checking az login..."
-  az account show --only-show-errors >/dev/null 2>&1 || die "Not logged in. Run: az login --tenant <tenant-id>"
+  ensure_azure_cli_login
 
   local sub_id
   sub_id="${TF_VAR_azure_subscription_id}"
@@ -847,6 +953,7 @@ validate() {
   run_with_timeout "${SETUP_TIMEOUT_TERRAFORM_VALIDATE_SECONDS}" terraform fmt -recursive -check
   log "terraform validate"
   run_with_timeout "${SETUP_TIMEOUT_TERRAFORM_VALIDATE_SECONDS}" terraform validate
+  ensure_helm_test_repositories
   log "terraform test (plan-only)"
   run_with_timeout "${SETUP_TIMEOUT_TERRAFORM_TEST_SECONDS}" terraform test -filter=tests/plan.tftest.hcl
   log "terraform test (identity contract)"
@@ -914,6 +1021,68 @@ deploy_e2e_handoff_file() {
   harness_state_file "deploy-e2e.pause.txt"
 }
 
+write_anyscale_cli_handoff() {
+  local continue_command="$1"
+  local intro_message="$2"
+  local handoff_file token_steps
+
+  load_env
+  sync_anyscale_cli_env
+
+  handoff_file="$(deploy_e2e_handoff_file)"
+  mkdir -p "$(dirname "${handoff_file}")"
+
+  if [[ -n "${ANYSCALE_CLI_TOKEN:-}" ]]; then
+    token_steps=$(cat <<EOF
+ANYSCALE_CLI_TOKEN is already set in ${ENV_FILE}.
+
+If you want to rotate the token before continuing, update only ANYSCALE_CLI_TOKEN.
+EOF
+)
+  else
+    token_steps=$(cat <<EOF
+Do this now:
+  1. Open ${ENV_FILE}
+  2. Set ANYSCALE_CLI_TOKEN="<Anyscale user or service-account API key>"
+  3. Save ${ENV_FILE}
+EOF
+)
+  fi
+
+  cat > "${handoff_file}" <<EOF
+${intro_message}
+
+The script has already derived these values in ${ENV_FILE}:
+  ANYSCALE_HOST="${ANYSCALE_HOST:-}"
+  ANYSCALE_CLOUD_NAME="${ANYSCALE_CLOUD_NAME:-}"
+  ANYSCALE_CLOUD_DEPLOYMENT_ID="${ANYSCALE_CLOUD_DEPLOYMENT_ID:-}"
+
+${token_steps}
+
+Do not change ANYSCALE_HOST, ANYSCALE_CLOUD_NAME, or ANYSCALE_CLOUD_DEPLOYMENT_ID
+unless you are intentionally overriding the deployed cloud. The continuation step
+will refresh those values from Azure again if needed.
+
+Continue with:
+  ${continue_command}
+
+Part 2 will:
+  - start or reuse the Azure Bastion tunnel
+  - export a Bastion-backed kubeconfig
+  - patch the live anyscale-operator release with ANYSCALE_CLI_TOKEN
+  - register the aks-cpu and aks-gpu compute configs
+  - register the aks-cpu-workspace and aks-gpu-workspace workspaces
+  - confirm that you are ready to go with a workspace that has CPU and GPU configs ready
+
+The continuation step expects the repo-local Anyscale CLI at $(anyscale_cli_bin).
+See README.md if you still need to create .venv and install the anyscale package.
+
+Handoff file: ${handoff_file}
+EOF
+
+  cat "${handoff_file}"
+}
+
 deploy_e2e_cleanup() {
   if [[ "${DEPLOY_E2E_STARTED_TUNNEL:-0}" == "1" ]]; then
     bastion_tunnel stop >/dev/null 2>&1 || true
@@ -931,13 +1100,13 @@ ensure_deploy_e2e_bastion_access() {
   fi
 
   kubeconfig_path="$(kubeconfig_bastion --print-path)"
-  export KUBECONFIG="${kubeconfig_path}"
+  export_kubeconfig_env "${kubeconfig_path}"
   log "Using Bastion-backed kubeconfig ${KUBECONFIG}"
   kubectl get nodes -o wide
 }
 
 pause_for_anyscale_cli_token_if_missing() {
-  local handoff_file
+  local continue_command="${1:-./scripts/setup.sh deploy-e2e --resume}"
 
   load_env
   sync_anyscale_cli_env
@@ -945,56 +1114,69 @@ pause_for_anyscale_cli_token_if_missing() {
     return 1
   fi
 
-  handoff_file="$(deploy_e2e_handoff_file)"
-  mkdir -p "$(dirname "${handoff_file}")"
-
-  cat > "${handoff_file}" <<EOF
-deploy-e2e paused because ANYSCALE_CLI_TOKEN is not set in ${ENV_FILE}.
-
-The script has already derived these values in ${ENV_FILE}:
-  ANYSCALE_HOST="${ANYSCALE_HOST:-}"
-  ANYSCALE_CLOUD_NAME="${ANYSCALE_CLOUD_NAME:-}"
-  ANYSCALE_CLOUD_DEPLOYMENT_ID="${ANYSCALE_CLOUD_DEPLOYMENT_ID:-}"
-
-Do this now:
-  1. Open ${ENV_FILE}
-  2. Set ANYSCALE_CLI_TOKEN="<Anyscale user or service-account API key>"
-  3. Save ${ENV_FILE}
-
-Do not change ANYSCALE_HOST, ANYSCALE_CLOUD_NAME, or ANYSCALE_CLOUD_DEPLOYMENT_ID
-unless you are intentionally overriding the deployed cloud. The resume step will
-refresh those values from Azure again if needed.
-
-Resume with:
-  ./scripts/setup.sh deploy-e2e --resume
-
-The resume step will:
-  - start or reuse the Azure Bastion tunnel
-  - export a Bastion-backed kubeconfig
-  - patch the live anyscale-operator release with ANYSCALE_CLI_TOKEN
-  - register the aks-cpu and aks-gpu compute configs
-  - register the aks-cpu-workspace and aks-gpu-workspace workspaces
-
-The resume step expects the repo-local Anyscale CLI at $(anyscale_cli_bin).
-See README.md if you still need to create .venv and install the anyscale package.
-
-Handoff file: ${handoff_file}
-EOF
+  write_anyscale_cli_handoff \
+    "${continue_command}" \
+    "Anyscale post-configuration is paused because ANYSCALE_CLI_TOKEN is not set in ${ENV_FILE}."
 
   warn "Paused before Anyscale post-configuration because ANYSCALE_CLI_TOKEN is unset."
-  cat "${handoff_file}"
   return 0
 }
 
 run_anyscale_post_config_sequence() {
-  if pause_for_anyscale_cli_token_if_missing; then
+  local continue_command="${1:-./scripts/setup.sh deploy-e2e --resume}"
+
+  if pause_for_anyscale_cli_token_if_missing "${continue_command}"; then
     return 0
   fi
 
   ensure_deploy_e2e_bastion_access
   log "Running Anyscale post-configuration and workspace registration"
   anyscale_workspaces_register
+  log "You are ready to go with a workspace that has CPU and GPU configs ready."
   log "Anyscale post-configuration finished. Next run ./scripts/setup.sh anyscale-workspaces-runtime-proof start-gpu, wait-gpu, and gpu-probe for the bounded GPU runtime proof."
+}
+
+deploy_part1_handoff() {
+  local continue_command="${1:-./scripts/setup.sh deploy-part2}"
+
+  write_anyscale_cli_handoff \
+    "${continue_command}" \
+    "Part 1 is complete. Azure foundation, private AKS, Bastion access, and the Anyscale platform deployment are finished."
+
+  if [[ -z "${ANYSCALE_CLI_TOKEN:-}" ]]; then
+    warn "Part 1 finished. Update ANYSCALE_CLI_TOKEN in ${ENV_FILE}, then run ${continue_command}."
+  else
+    log "Part 1 finished. ANYSCALE_CLI_TOKEN is already set. Continue with ${continue_command} when you are ready."
+  fi
+}
+
+remove_local_terraform_state_artifacts() {
+  rm -f terraform.tfstate terraform.tfstate.backup .terraform.tfstate.lock.info tfplan *.tfplan
+  rm -f terraform.tfstate.*.backup
+}
+
+ensure_local_state_matches_target() {
+  local desired_resource_group current_resource_group backup_path
+
+  [[ -f terraform.tfstate ]] || return 0
+
+  desired_resource_group="$(resource_group_name)"
+  current_resource_group="$(jq -r '.outputs.resource_group_name.value // empty' terraform.tfstate 2>/dev/null || true)"
+
+  [[ -n "${current_resource_group}" ]] || return 0
+  [[ "${current_resource_group}" == "${desired_resource_group}" ]] && return 0
+
+  backup_path="$(terraform_state_backup_path "retarget-${current_resource_group}")"
+  cp terraform.tfstate "${backup_path}"
+
+  if [[ -f terraform.tfstate.backup ]]; then
+    cp terraform.tfstate.backup "${backup_path}.previous"
+  fi
+
+  warn "Local Terraform state targets ${current_resource_group}, but the current deployment target is ${desired_resource_group}."
+  log "Backed up the previous local Terraform state to ${backup_path}"
+  log "Clearing local Terraform state and saved plans before continuing with the new target"
+  remove_local_terraform_state_artifacts
 }
 
 deploy_e2e_phase1() {
@@ -1007,12 +1189,18 @@ deploy_e2e_phase1() {
 }
 
 deploy_e2e_phase2() {
+  local skip_auto_workspace_ready="${1:-1}"
+
   log "Phase 2: connect through Bastion and finish the deployment"
   unset TF_VAR_cluster_bootstrap TF_VAR_anyscale_platform
   ensure_deploy_e2e_bastion_access
   export TF_VAR_cluster_bootstrap="{\"kubeconfig_path\":\"${KUBECONFIG}\"}"
   plan
-  apply
+  if [[ "${skip_auto_workspace_ready}" == "1" ]]; then
+    SETUP_SKIP_AUTO_ANYSCALE_WORKSPACE_READY=1 apply
+  else
+    apply
+  fi
   outputs
 }
 
@@ -1075,7 +1263,7 @@ USAGE
   preflight
 
   if [[ "${resume}" == true ]]; then
-    run_anyscale_post_config_sequence
+    run_anyscale_post_config_sequence "./scripts/setup.sh deploy-e2e --resume"
     return 0
   fi
 
@@ -1085,13 +1273,127 @@ USAGE
     else
       nuke
     fi
+  else
+    ensure_local_state_matches_target
   fi
 
   tf_init
   validate
   deploy_e2e_phase1
-  deploy_e2e_phase2
-  run_anyscale_post_config_sequence
+  deploy_e2e_phase2 1
+  run_anyscale_post_config_sequence "./scripts/setup.sh deploy-e2e --resume"
+}
+
+deploy_part1() {
+  local from_scratch=false
+  local force_nuke=false
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --from-scratch)
+        from_scratch=true
+        shift
+        ;;
+      --yes|-y)
+        force_nuke=true
+        shift
+        ;;
+      --help|-h)
+        cat <<'USAGE'
+Usage:
+  ./scripts/setup.sh deploy-part1
+  ./scripts/setup.sh deploy-part1 --from-scratch --yes
+
+Runs the Terraform-backed deployment flow through the manual Anyscale token handoff.
+
+Default mode:
+  - preflight + init + validate
+  - if the target AKS cluster does not exist yet, run phase 1 Terraform deploy
+    (Azure foundation + private AKS only)
+  - start or reuse the Bastion tunnel and export a Bastion-backed kubeconfig
+  - run the phase 2 Terraform reconciliation (cluster bootstrap + Anyscale platform)
+  - stop with exact instructions for the manual ANYSCALE_CLI_TOKEN handoff
+
+Options:
+  --from-scratch  Run ./scripts/setup.sh nuke first. Use --yes to skip the prompt.
+  --yes, -y       Pass --yes to nuke when used with --from-scratch.
+USAGE
+        return 0
+        ;;
+      *)
+        die "Unknown deploy-part1 option: $1"
+        ;;
+    esac
+  done
+
+  [[ "${from_scratch}" == false && "${force_nuke}" == true ]] && die "--yes is only valid with --from-scratch."
+
+  DEPLOY_E2E_STARTED_TUNNEL=0
+  trap deploy_e2e_cleanup EXIT
+
+  preflight
+
+  if [[ "${from_scratch}" == true ]]; then
+    if [[ "${force_nuke}" == true ]]; then
+      nuke --yes
+    else
+      nuke
+    fi
+  else
+    ensure_local_state_matches_target
+  fi
+
+  tf_init
+  validate
+
+  if aks_cluster_exists_for_target; then
+    log "Target AKS cluster $(target_aks_cluster_name) already exists. Skipping the phase-1 toggle apply and reconciling phase 2 to keep part 1 idempotent."
+  else
+    deploy_e2e_phase1
+  fi
+
+  deploy_e2e_phase2 1
+  deploy_part1_handoff "./scripts/setup.sh deploy-part2"
+}
+
+deploy_part2() {
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --help|-h)
+        cat <<'USAGE'
+Usage:
+  ./scripts/setup.sh deploy-part2
+
+Continues from the manual ANYSCALE_CLI_TOKEN handoff.
+
+This command is designed to be safe to rerun after phase-2 or post-config changes.
+
+What it does:
+  - preflight
+  - terraform init + validate
+  - start or reuse the Bastion tunnel and export a Bastion-backed kubeconfig
+  - rerun the phase 2 Terraform reconciliation
+  - patch the live anyscale-operator release with ANYSCALE_CLI_TOKEN
+  - create or reuse the aks-cpu and aks-gpu compute configs
+  - create or reuse the aks-cpu-workspace and aks-gpu-workspace workspaces
+  - confirm that you are ready to go with a workspace that has CPU and GPU configs ready
+USAGE
+        return 0
+        ;;
+      *)
+        die "Unknown deploy-part2 option: $1"
+        ;;
+    esac
+  done
+
+  DEPLOY_E2E_STARTED_TUNNEL=0
+  trap deploy_e2e_cleanup EXIT
+
+  preflight
+  tf_init
+  validate
+  deploy_e2e_phase2 1
+  run_anyscale_post_config_sequence "./scripts/setup.sh deploy-part2"
 }
 
 ###############################################################################
@@ -1455,11 +1757,13 @@ USAGE
 
   if [[ "${export_line}" == true ]]; then
     printf 'export KUBECONFIG=%q\n' "${kubeconfig_file}"
+    printf 'export KUBE_CONFIG_PATH=%q\n' "${kubeconfig_file}"
     return 0
   fi
 
   log "Bastion kubeconfig ready at ${kubeconfig_file}"
   printf 'export KUBECONFIG=%q\n' "${kubeconfig_file}"
+  printf 'export KUBE_CONFIG_PATH=%q\n' "${kubeconfig_file}"
   KUBECONFIG="${kubeconfig_file}" kubectl get nodes -o wide
 }
 
@@ -2448,6 +2752,12 @@ wait_for_anyscale_workspace_running() {
         ;;
     esac
 
+    if anyscale_workspace_runtime_ready_on_cluster "${workspace_name}"; then
+      warn "Workspace ${workspace_name} is still reported as ${current_status} by the Anyscale API, but the Ray head pod is Ready and serving on the cluster. Proceeding with Kubernetes-backed readiness confirmation."
+      ANYSCALE_WORKSPACE_WAIT_RESULT="RUNNING (confirmed via Kubernetes head-pod readiness while Anyscale API reported ${current_status})"
+      return 0
+    fi
+
     current_epoch=$(date +%s)
     if (( current_epoch >= deadline )); then
       ANYSCALE_WORKSPACE_WAIT_RESULT="Timed out waiting for RUNNING; last observed state=${current_status}"
@@ -2506,6 +2816,12 @@ wait_for_anyscale_workspace_running_attempts() {
         ;;
     esac
 
+    if anyscale_workspace_runtime_ready_on_cluster "${workspace_name}"; then
+      warn "Workspace ${workspace_name} is still reported as ${current_status} by the Anyscale API, but the Ray head pod is Ready and serving on the cluster. Proceeding with Kubernetes-backed readiness confirmation."
+      ANYSCALE_WORKSPACE_WAIT_RESULT="RUNNING (confirmed via Kubernetes head-pod readiness while Anyscale API reported ${current_status})"
+      return 0
+    fi
+
     if (( attempt < max_attempts )); then
       sleep "${interval_seconds}"
     fi
@@ -2513,6 +2829,29 @@ wait_for_anyscale_workspace_running_attempts() {
 
   ANYSCALE_WORKSPACE_WAIT_RESULT="Timed out waiting for RUNNING after ${max_attempts} attempts; last observed state=${current_status}"
   return 1
+}
+
+anyscale_workspace_runtime_ready_on_cluster() {
+  local workspace_name="$1"
+  local namespace head_pod_name pod_phase pod_ready
+
+  namespace="${TF_VAR_anyscale_operator_namespace}"
+  head_pod_name="$(kubectl get pods -n "${namespace}" \
+    -l "app.kubernetes.io/name=${workspace_name},ray-node-type=head" \
+    -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)"
+
+  [[ -n "${head_pod_name}" ]] || return 1
+
+  pod_phase="$(kubectl get pod -n "${namespace}" "${head_pod_name}" \
+    -o jsonpath='{.status.phase}' 2>/dev/null || true)"
+  pod_ready="$(kubectl get pod -n "${namespace}" "${head_pod_name}" \
+    -o jsonpath='{range .status.conditions[?(@.type=="Ready")]}{.status}{end}' 2>/dev/null || true)"
+
+  [[ "${pod_phase}" == "Running" && "${pod_ready}" == "True" ]] || return 1
+
+  run_with_timeout "${SETUP_TIMEOUT_ANYSCALE_WORKSPACE_COMMAND_SECONDS}" \
+    kubectl exec -n "${namespace}" -c ray "${head_pod_name}" -- \
+    bash -lc 'ray status >/dev/null 2>&1'
 }
 
 wait_for_anyscale_workspace_terminated_attempts() {
@@ -2599,6 +2938,111 @@ workspace_exec_head_bash_with_timeout() {
 
   run_with_timeout "${timeout_seconds}" \
     kubectl exec -n "${namespace}" -c ray "${head_pod_name}" -- bash -lc "${script}"
+}
+
+###############################################################################
+anyscale_workspace_create() {
+  local workspace_name=""
+  local compute_config_name="aks-cpu"
+  local start_workspace=false
+  local cli_bin create_log start_log
+  local create_output create_status=0
+  local start_output
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --name)
+        [[ $# -ge 2 ]] || die "Missing value for --name"
+        workspace_name="$2"
+        shift 2
+        ;;
+      --compute-config)
+        [[ $# -ge 2 ]] || die "Missing value for --compute-config"
+        compute_config_name="$2"
+        shift 2
+        ;;
+      --start)
+        start_workspace=true
+        shift
+        ;;
+      --help|-h)
+        cat <<'USAGE'
+Usage:
+  ./scripts/setup.sh anyscale-workspace-create --name my-workspace
+  ./scripts/setup.sh anyscale-workspace-create --name my-gpu-workspace --compute-config aks-gpu --start
+
+Creates an additional workspace through the Anyscale CLI using an existing
+named compute config on the configured cloud. This is the supported repo-level
+fallback when the Anyscale console workspace-create wizard fails to discover an
+Azure compute-config template on a manually registered AKS cloud.
+USAGE
+        return 0
+        ;;
+      *)
+        die "Unknown anyscale-workspace-create option: $1"
+        ;;
+    esac
+  done
+
+  [[ -n "${workspace_name}" ]] || die "anyscale-workspace-create requires --name"
+
+  load_env
+  sync_anyscale_cli_env
+  require_anyscale_cli
+  require_env_var ANYSCALE_CLI_TOKEN
+  require_env_var ANYSCALE_CLOUD_NAME
+
+  cli_bin="$(anyscale_cli_bin)"
+  mkdir -p "${CACHE_DIR}"
+  create_log="${CACHE_DIR}/${workspace_name}.create.log"
+  start_log="${CACHE_DIR}/${workspace_name}.start.log"
+
+  if ! run_with_timeout "${SETUP_TIMEOUT_ANYSCALE_COMMAND_SECONDS}" \
+    "${cli_bin}" compute-config get \
+      --name "${compute_config_name}" \
+      --cloud-name "${ANYSCALE_CLOUD_NAME}" >/dev/null 2>&1; then
+    die "Compute config ${compute_config_name} was not found on ${ANYSCALE_CLOUD_NAME}. Run ./scripts/setup.sh deploy-part2 or ./scripts/setup.sh anyscale-workspaces-register first, or pass an existing --compute-config."
+  fi
+
+  if run_with_timeout "${SETUP_TIMEOUT_ANYSCALE_COMMAND_SECONDS}" \
+    "${cli_bin}" workspace_v2 status \
+      --name "${workspace_name}" \
+      --cloud "${ANYSCALE_CLOUD_NAME}" >/dev/null 2>&1; then
+    log "Workspace ${workspace_name} already exists on ${ANYSCALE_CLOUD_NAME}"
+  else
+    log "Registering workspace ${workspace_name} with compute config ${compute_config_name}"
+    if ! create_output="$(run_with_timeout "${SETUP_TIMEOUT_ANYSCALE_COMMAND_SECONDS}" \
+      "${cli_bin}" workspace_v2 create \
+        --name "${workspace_name}" \
+        --compute-config "${compute_config_name}" \
+        --cloud "${ANYSCALE_CLOUD_NAME}" 2>&1)"; then
+      create_status=$?
+    fi
+    printf '%s\n' "${create_output}" | tee "${create_log}"
+    if [[ "${create_status}" -ne 0 ]] && ! grep -q 'Workspace created successfully id:' <<<"${create_output}"; then
+      die "The workspace create step failed for ${workspace_name}. See ${create_log}."
+    fi
+  fi
+
+  if [[ "${start_workspace}" != true ]]; then
+    log "Workspace ${workspace_name} is registered with compute-config ${compute_config_name}. Start it from the Anyscale console when you want to use it."
+    return 0
+  fi
+
+  log "Starting workspace ${workspace_name}"
+  if ! start_output="$(run_with_timeout "${SETUP_TIMEOUT_ANYSCALE_COMMAND_SECONDS}" \
+    "${cli_bin}" workspace_v2 start \
+      --name "${workspace_name}" \
+      --cloud "${ANYSCALE_CLOUD_NAME}" 2>&1)"; then
+    printf '%s\n' "${start_output}" | tee "${start_log}"
+    if ! grep -Eiq 'already.*running|currently in state: STARTING' <<<"${start_output}"; then
+      die "The workspace start step failed for ${workspace_name}. See ${start_log}."
+    fi
+  else
+    printf '%s\n' "${start_output}" | tee "${start_log}"
+  fi
+
+  log "Workspace ${workspace_name} is starting with compute-config ${compute_config_name}."
 }
 
 ###############################################################################
@@ -3045,6 +3489,7 @@ EOF
 ###############################################################################
 post() {
   log "Kubernetes bootstrap is Terraform-managed. Re-run terraform apply to reconcile the operator service account, NVIDIA device plugin, and ingress-nginx releases."
+  log "For the simplest guided flow, run ./scripts/setup.sh deploy-part1 --from-scratch --yes, update ONLY ANYSCALE_CLI_TOKEN in .env if needed, then run ./scripts/setup.sh deploy-part2."
   log "For the guided two-phase flow with an ANYSCALE_CLI_TOKEN pause/resume handoff, run ./scripts/setup.sh deploy-e2e --from-scratch --yes and later resume with ./scripts/setup.sh deploy-e2e --resume."
   log "If the current shell already has a Bastion-backed kubeconfig and ANYSCALE_CLI_TOKEN, ./scripts/setup.sh apply now auto-runs ./scripts/setup.sh anyscale-workspace-ready after Terraform finishes."
   log "Otherwise, rerun ./scripts/setup.sh anyscale-workspace-ready to inject the Azure CLI token and AKS-aligned CPU/GPU instance types into the operator release."
@@ -3134,8 +3579,7 @@ USAGE
   fi
 
   log "Removing local Terraform state and saved plans"
-  rm -f terraform.tfstate terraform.tfstate.backup .terraform.tfstate.lock.info tfplan *.tfplan
-  rm -f terraform.tfstate.*.backup
+  remove_local_terraform_state_artifacts
   clear_anyscale_cloud_deployment_id
   log "Nuke completed. Run ./scripts/setup.sh init before the next plan/apply if providers are not initialized."
 }
@@ -3149,6 +3593,8 @@ case "${cmd}" in
   validate)   validate ;;
   plan)       plan ;;
   apply)      apply ;;
+  deploy-part1) shift; deploy_part1 "$@" ;;
+  deploy-part2) shift; deploy_part2 "$@" ;;
   deploy-e2e) shift; deploy_e2e "$@" ;;
   outputs)    outputs ;;
   bastion)    shift; bastion "$@" ;;
@@ -3156,6 +3602,7 @@ case "${cmd}" in
   kubeconfig) kubeconfig ;;
   kubeconfig-bastion) shift; kubeconfig_bastion "$@" ;;
   anyscale-workspace-ready) shift; anyscale_workspace_ready "$@" ;;
+  anyscale-workspace-create) shift; anyscale_workspace_create "$@" ;;
   anyscale-workspaces-register) shift; anyscale_workspaces_register "$@" ;;
   anyscale-workspaces-runtime-proof) shift; anyscale_workspaces_runtime_proof "$@" ;;
   post)       post ;;
@@ -3168,5 +3615,5 @@ case "${cmd}" in
   destroy)    destroy ;;
   nuke)       shift; nuke "$@" ;;
   all)        preflight; tf_init; validate; plan; apply; outputs ;;
-  *) die "Usage: $0 {preflight|tfvars|init|validate|plan|apply|deploy-e2e|outputs|bastion|bastion-tunnel|kubeconfig|kubeconfig-bastion|anyscale-workspace-ready|anyscale-workspaces-register|anyscale-workspaces-runtime-proof|post|control-plane-egress-smoke|validate-focused|validate-k8s|validate-observability|functional-test|status|destroy|nuke|all}" ;;
+  *) die "Usage: $0 {preflight|tfvars|init|validate|plan|apply|deploy-part1|deploy-part2|deploy-e2e|outputs|bastion|bastion-tunnel|kubeconfig|kubeconfig-bastion|anyscale-workspace-ready|anyscale-workspace-create|anyscale-workspaces-register|anyscale-workspaces-runtime-proof|post|control-plane-egress-smoke|validate-focused|validate-k8s|validate-observability|functional-test|status|destroy|nuke|all}" ;;
 esac

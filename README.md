@@ -24,7 +24,7 @@ For the local workstation, work from a macOS or Linux shell with Git, Azure CLI,
 
 For Azure access, you need to be able to log in to the target tenant and subscription and create the full set of resources this stack uses: networking, Azure Firewall, Azure Bastion, AKS, Private Link, storage, ACR, Log Analytics, managed identities, federated identity credentials, and RBAC assignments. If the target subscription has not already accepted the Anyscale marketplace offer, it also needs permission to create or accept that agreement during the phase-2 deployment. The sample configuration assumes GPU quota for `Standard_NC16as_T4_v3` in the target region because the default validated path keeps one T4 node warm for workspace and smoke-test bring-up.
 
-For Anyscale access, the infrastructure deployment itself does not require an API token, but the post-deploy helper commands do. `./scripts/setup.sh anyscale-workspace-ready` and `./scripts/setup.sh anyscale-workspaces-register` both require `ANYSCALE_CLI_TOKEN` in `.env`, and they also expect the repo-local CLI binary at `.venv/bin/anyscale`. Current Anyscale documentation says service accounts can be created with CLI, but service-account API keys are still created in the Anyscale console, so the guided repo automation intentionally pauses for that handoff when the token is missing.
+For Anyscale access, the infrastructure deployment itself does not require an API token, but the post-deploy helper commands do. `./scripts/setup.sh anyscale-workspace-ready`, `./scripts/setup.sh anyscale-workspaces-register`, and the new guided `./scripts/setup.sh deploy-part2` flow all require `ANYSCALE_CLI_TOKEN` in `.env`, and they also expect the repo-local CLI binary at `.venv/bin/anyscale`. Current Anyscale documentation says service accounts can be created with CLI, but service-account API keys are still created in the Anyscale console, so the guided repo automation intentionally splits the operator path into part 1 and part 2 around that manual handoff.
 
 ## Start from a fresh clone
 
@@ -36,7 +36,7 @@ cp .env-template .env
 
 The `.env-template` file is the source of truth for required inputs, and it is intentionally verbose. In practice you need to provide the Azure subscription and tenant IDs, choose the naming and region values, confirm the VNet and subnet CIDRs, review the outbound allowlists, replace the placeholder ownership tags, and decide whether the default AKS and GPU settings are acceptable in your region. The defaults are opinionated on purpose: they pin AKS to `1.34.6`, keep the GPU pool at `min_count=1`, enable Azure Monitor diagnostics, and default the operator identity mode to `{"mode":"create"}`.
 
-The Anyscale section of `.env` is much smaller than it first appears. `ANYSCALE_CLOUD_NAME` is derived from the deployed Azure resource name when it is blank, `ANYSCALE_CLOUD_DEPLOYMENT_ID` is discovered from the live platform deployment after phase 2 completes, and `ANYSCALE_CLI_TOKEN` is the only value you normally supply yourself. You can leave `ANYSCALE_CLI_TOKEN` blank for the Terraform phases and fill it in only when the guided `deploy-e2e` workflow pauses after phase 2. The default authentication path for Terraform is `ARM_USE_CLI=true`, which means the wrapper assumes a normal local `az login`. If you need service principal, OIDC, or managed identity auth instead, the commented `ARM_*` settings in `.env-template` are the place to start.
+The Anyscale section of `.env` is much smaller than it first appears. `ANYSCALE_CLOUD_NAME` is derived from the deployed Azure resource name when it is blank, `ANYSCALE_CLOUD_DEPLOYMENT_ID` is discovered from the live platform deployment after phase 2 completes, and `ANYSCALE_CLI_TOKEN` is the only value you normally supply yourself. You can leave `ANYSCALE_CLI_TOKEN` blank for the Terraform phases and fill it in only when `./scripts/setup.sh deploy-part1` stops after phase 2 and tells you to continue with `./scripts/setup.sh deploy-part2`. The default authentication path for Terraform is `ARM_USE_CLI=true`, which means the wrapper assumes a normal local `az login`. If you need service principal, OIDC, or managed identity auth instead, the commented `ARM_*` settings in `.env-template` are the place to start.
 
 The wrapper renders `infra/terraform/terraform.auto.tfvars.json` from `.env`. You can do that explicitly with `./scripts/setup.sh tfvars`, but every major wrapper command also re-renders it automatically, so the dedicated command is mostly useful when you want to inspect the generated JSON after editing `.env`.
 
@@ -59,33 +59,37 @@ source .venv/bin/activate
 UV_CACHE_DIR="$PWD/.cache/uv-cache" uv pip install --python .venv/bin/python anyscale
 ```
 
-If you want an interactive CLI session for manual exploration, you can run `.venv/bin/anyscale login`. That is useful for ad hoc inspection, but it does not replace `ANYSCALE_CLI_TOKEN` for `anyscale-workspace-ready` or `anyscale-workspaces-register`; those helpers read the token from `.env` and fail fast when it is missing. The guided `deploy-e2e` orchestration can pause before those steps, but the resume path still expects the repo-local CLI binary at `.venv/bin/anyscale`.
+If you want an interactive CLI session for manual exploration, you can run `.venv/bin/anyscale login`. That is useful for ad hoc inspection, but it does not replace `ANYSCALE_CLI_TOKEN` for `anyscale-workspace-ready`, `anyscale-workspaces-register`, or `deploy-part2`; those helpers read the token from `.env` and fail fast when it is missing. The guided `deploy-part1` orchestration pauses before those steps, and `deploy-part2` still expects the repo-local CLI binary at `.venv/bin/anyscale`.
 
 ## Understand the deployment flow before you start
 
 This repository uses a two-phase deployment on purpose. The Azure infrastructure, private AKS cluster, storage, registry, identity, networking, and observability resources can be created without local Kubernetes access, but the Terraform-managed bootstrap layer and the Anyscale platform deployment need a working path to the private AKS API. That path is provided by Azure Bastion and a Bastion-backed kubeconfig that points Terraform, `kubectl`, and `helm` at a local tunnel rather than at the private AKS DNS name directly.
 
-The wrapper includes `./scripts/setup.sh all`, but that command only covers the Terraform portion of the workflow. For this repository, the supported guided from-scratch path is `./scripts/setup.sh deploy-e2e --from-scratch --yes`; it runs the same phase-1 and phase-2 sequence below, then either continues into the Anyscale post-configuration or pauses with exact instructions to update `.env` and resume. The explicit phase-1 and phase-2 sequence below remains the manual equivalent when you want tighter control over each step.
+The wrapper includes `./scripts/setup.sh all`, but that command only covers the Terraform portion of the workflow. For this repository, the simplest supported guided path is `./scripts/setup.sh deploy-part1 --from-scratch --yes`, then after the manual token handoff `./scripts/setup.sh deploy-part2`. After the initial bring-up, `deploy-part2` is the preferred idempotent reconciliation command to rerun when you change phase-2 Terraform, operator settings, or workspace registration behavior. The explicit phase-1 and phase-2 sequence below remains the manual equivalent when you want tighter control over each step.
 
-## Guided end-to-end orchestration with token handoff
+## Guided two-step orchestration with token handoff
 
-If you want the repository to drive the full deployment and stop at the exact point where manual Anyscale input is still required, use the guided wrapper.
-
-```bash
-./scripts/setup.sh deploy-e2e --from-scratch --yes
-```
-
-That command runs `nuke`, `preflight`, `init`, `validate`, the phase-1 Terraform deployment, the Bastion tunnel and Bastion-backed kubeconfig handoff, and the phase-2 Terraform deployment. If `ANYSCALE_CLI_TOKEN` is already present in `.env`, it continues into `anyscale-workspaces-register`. If the token is missing, the command exits cleanly after phase 2, writes the handoff to `.cache/aks-anyscale-sample-harness/deploy-e2e.pause.txt`, and prints exactly what to do next.
-
-This is the required workaround for the current Anyscale auth gap: let the script provision everything it can, stop after phase 2, add `ANYSCALE_CLI_TOKEN` to `.env` from the Anyscale console, then resume with `./scripts/setup.sh deploy-e2e --resume`.
-
-At the pause point, update only `ANYSCALE_CLI_TOKEN` in `.env` and then resume:
+If you want the repository to drive the full deployment and make the operator handoff dead simple, use the two-step wrapper.
 
 ```bash
-./scripts/setup.sh deploy-e2e --resume
+./scripts/setup.sh deploy-part1 --from-scratch --yes
 ```
 
-The resume command reuses or restarts the Bastion tunnel, exports a Bastion-backed kubeconfig, revalidates the derived Anyscale cloud metadata in `.env`, patches the live `anyscale-operator` release, and runs `anyscale-workspaces-register` to create or reuse the durable CPU and GPU workspaces.
+Part 1 runs `nuke`, `preflight`, `init`, `validate`, the phase-1 Terraform deployment, the Bastion tunnel and Bastion-backed kubeconfig handoff, and the phase-2 Terraform deployment. It then stops on purpose and writes the exact handoff to `.cache/aks-anyscale-sample-harness/deploy-e2e.pause.txt` so you can do the one remaining manual step. If you rerun part 1 against an environment where the target AKS cluster already exists, it skips the destructive phase-1 toggle apply and just reconciles phase 2 before stopping again at the handoff.
+
+This is the required workaround for the current Anyscale auth gap: let the script provision everything it can, stop after phase 2, add `ANYSCALE_CLI_TOKEN` to `.env` from the Anyscale console, then continue with part 2.
+
+At the pause point, update only `ANYSCALE_CLI_TOKEN` in `.env` and then run:
+
+```bash
+./scripts/setup.sh deploy-part2
+```
+
+Part 2 reuses or restarts the Bastion tunnel, reruns `terraform init` and the repository validation checks, exports a Bastion-backed kubeconfig, reapplies the phase-2 Terraform configuration, patches the live `anyscale-operator` release, and runs `anyscale-workspaces-register` to create or reuse the durable CPU and GPU workspaces. When it finishes, it prints that you are ready to go with a workspace that has CPU and GPU configs ready.
+
+In practice, once part 1 has established the environment and you have supplied `ANYSCALE_CLI_TOKEN`, `./scripts/setup.sh deploy-part2` is the command you can keep rerunning after changes. That is the supported idempotent path for reconciling phase-2 infrastructure plus the Anyscale operator and workspace state.
+
+The older `./scripts/setup.sh deploy-e2e --from-scratch --yes` plus `./scripts/setup.sh deploy-e2e --resume` flow still works as a compatibility wrapper, but `deploy-part1` and `deploy-part2` are now the primary operator path.
 
 ## Phase 1: build the Azure foundation and private AKS cluster
 
@@ -134,7 +138,7 @@ During phase 2, `plan` and `apply` also reconcile marketplace and platform state
 
 If the current shell already has a Bastion-backed kubeconfig, `ANYSCALE_CLI_TOKEN`, `.venv/bin/anyscale`, `kubectl`, `kubelogin`, `helm`, and `jq`, the phase-2 `apply` automatically runs `./scripts/setup.sh anyscale-workspace-ready` as the final step. If any of those prerequisites are missing, the apply still succeeds, but you need to run the post-configuration step yourself later from a Bastion-backed shell.
 
-The guided `deploy-e2e` wrapper uses these same phase-2 mechanics. The difference is that it turns the missing-token case into an intentional pause with exact resume instructions instead of leaving the operator to reconstruct the remaining steps by hand.
+The guided `deploy-part1` and `deploy-part2` wrappers use these same phase-2 mechanics. The difference is that they turn the missing-token case into an intentional part-1 stop and a dead-simple part-2 continuation instead of leaving the operator to reconstruct the remaining steps by hand. `deploy-part2` is also the recommended idempotent rerun path after later phase-2 or post-config changes.
 
 ## How private AKS access works in this repository
 
@@ -183,6 +187,15 @@ Once the operator patch is in place, register the dedicated CPU and GPU workspac
 - `aks-gpu-workspace` — **registered only**. The helper does not start it, which keeps the GPU node pool scaled to its baseline until you actually need GPU capacity. Start it manually from the Anyscale console when you are ready to run a GPU workload.
 
 Existing compute configs and workspaces with the same names are reused, so this command is safe to re-run. Generated compute-config YAML and command logs are written under `.cache/` (for example `.cache/anyscale-compute.aks-cpu.yaml`, `.cache/aks-cpu-workspace.validate.log`, `.cache/aks-gpu-workspace.create.log`).
+
+If the Anyscale console **Create** flow fails on this manually registered AKS cloud with `Failed to find compute config template for AZURE`, that is not a missing `deploy-part2` step in this repository. The backend workspace-create path is healthy; the same cloud accepts `workspace_v2 create` calls against the registered `aks-cpu` and `aks-gpu` compute configs. Use the repo wrapper below as the supported workaround for creating additional workspaces:
+
+```bash
+./scripts/setup.sh anyscale-workspace-create --name my-cpu-workspace --compute-config aks-cpu
+./scripts/setup.sh anyscale-workspace-create --name my-gpu-workspace --compute-config aks-gpu --start
+```
+
+The helper reuses an existing workspace name if it is already present, fails fast if the named compute config does not exist yet, and writes the create/start logs under `.cache/`.
 
 ### Run a bounded CLI runtime proof
 

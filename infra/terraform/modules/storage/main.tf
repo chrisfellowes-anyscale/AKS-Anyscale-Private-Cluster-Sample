@@ -110,9 +110,10 @@ resource "azurerm_private_endpoint" "dfs" {
 resource "azurerm_monitor_diagnostic_setting" "storage_account" {
   count = var.diagnostic_settings_enabled ? 1 : 0
 
-  name                       = "tfdiag-${var.storage_account_name}"
-  target_resource_id         = azurerm_storage_account.this.id
-  log_analytics_workspace_id = var.log_analytics_workspace_id
+  name                           = "tfdiag-${var.storage_account_name}"
+  target_resource_id             = azurerm_storage_account.this.id
+  log_analytics_workspace_id     = var.log_analytics_workspace_id
+  log_analytics_destination_type = "Dedicated"
 
   enabled_metric {
     category = "Transaction"
@@ -122,9 +123,10 @@ resource "azurerm_monitor_diagnostic_setting" "storage_account" {
 resource "azurerm_monitor_diagnostic_setting" "blob_service" {
   count = var.diagnostic_settings_enabled ? 1 : 0
 
-  name                       = "tfdiag-${var.storage_account_name}-blob"
-  target_resource_id         = "${azurerm_storage_account.this.id}/blobServices/default"
-  log_analytics_workspace_id = var.log_analytics_workspace_id
+  name                           = "tfdiag-${var.storage_account_name}-blob"
+  target_resource_id             = "${azurerm_storage_account.this.id}/blobServices/default"
+  log_analytics_workspace_id     = var.log_analytics_workspace_id
+  log_analytics_destination_type = "Dedicated"
 
   enabled_log {
     category = "StorageRead"

@@ -125,7 +125,7 @@ module "storage" {
   }
 
   log_analytics_workspace_id  = module.observability.log_analytics_workspace_id
-  diagnostic_settings_enabled = var.terraform_managed_diagnostic_settings_enabled
+  diagnostic_settings_enabled = var.storage_diagnostic_settings_enabled != null ? var.storage_diagnostic_settings_enabled : var.terraform_managed_diagnostic_settings_enabled
   tags                        = var.tags
 }
 
