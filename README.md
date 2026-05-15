@@ -267,6 +267,7 @@ Once the operator patch is in place, register the dedicated CPU and GPU workspac
 `anyscale-workspaces-register` is idempotent. It re-runs `anyscale-workspace-ready`, ensures the AKS-compatible **declarative** compute configs `aks-cpu` (head `CPU: 8 / memory: 32Gi` on `agentpool: cpu`, worker `cpu-workers` → same shape, 0–1 nodes) and `aks-gpu` (CPU head on `agentpool: cpu`, worker `gpu-workers` → `CPU: 8 / GPU: 1 / memory: 32Gi` on `agentpool: gput4`, 0–1 nodes) exist, then registers two workspaces against those configs. Each worker group uses `required_resources` instead of named instance types, so the operator dynamically generates pod shapes and the AKS scheduler places them on the matching node pool via the embedded `advanced_instance_config.spec.nodeSelector`/`tolerations`. The command refreshes any stale compute-config versions that still reference legacy named instance types and updates stopped or errored workspaces to the latest compute-config version:
 
 - `aks-cpu-workspace` — started automatically and waited until `RUNNING`. The helper then performs a fast structural check: it looks up the Ray head pod and confirms it is scheduled on an `aks-cpu-*` node. It deliberately does **not** run an in-script Ray task, because the head pod publishes `0` schedulable Ray `CPU` resources and the `cpu-workers` group autoscales from `0`; a `num_cpus=1` Ray task therefore blocks on autoscaling that may take several minutes or stall. Run the Ray CPU probe interactively (see the manual validation section below) instead.
+- `aks-cpu-workspace` — started automatically and waited until `RUNNING`. The helper then performs a fast structural check: it looks up the Ray head pod and confirms it is scheduled on an `aks-cpu-*` node. It deliberately does **not** run an in-script Ray task, because the head pod publishes `0` schedulable Ray `CPU` resources and the `cpu-workers` group autoscales from `0`; a `num_cpus=1` Ray task therefore blocks on autoscaling that may take several minutes or stall. Run the Ray CPU probe interactively (see the manual validation section below) instead. On a cold workspace the first `num_cpus=1` submission can still time out while the new `cpu-workers` pod finishes joining Ray; rerun the same probe after `ray status` shows an idle `cpu-workers` node.
 - `aks-gpu-workspace` — **registered only**. The helper does not start it, which keeps the GPU node pool scaled to its baseline until you actually need GPU capacity. Start it manually from the Anyscale console when you are ready to run a GPU workload.
 
 Existing compute configs and workspaces with the same names are reused, so this command is safe to re-run. Generated compute-config YAML and command logs are written under `.cache/` (for example `.cache/anyscale-compute.aks-cpu.yaml`, `.cache/aks-cpu-workspace.validate.log`, `.cache/aks-gpu-workspace.create.log`).
@@ -299,6 +300,8 @@ For convenience, `./scripts/setup.sh anyscale-workspaces-runtime-proof all` runs
 ```bash
 ./scripts/setup.sh anyscale-workspaces-runtime-proof cpu-probe --command-timeout-seconds 600
 ```
+
+If that first CPU probe times out on a cold workspace, check `ray status` from the head pod and rerun once the `cpu-workers` group appears as idle. In the validated AKS sample, the warmed-up retry returned `CPU_WORKSPACE_OK` without any compute-config or toleration changes.
 
 Generated logs are written under `.cache/`, including `.cache/aks-gpu-workspace.runtime.wait.log`, `.cache/aks-gpu-workspace.nvidia-smi.log`, `.cache/aks-gpu-workspace.ray-gpu.log`, and `.cache/aks-cpu-workspace.ray-cpu.log`.
 
@@ -406,7 +409,86 @@ This repository provisions its own AKS cluster today, but the same integration p
 
 ## Inspect the environment during and after deployment
 
-`./scripts/setup.sh outputs` prints the Terraform outputs. `./scripts/setup.sh status` gives you the read-only operator view of the environment: Terraform resource names, Anyscale cloud metadata, Azure AKS state, node pool state, enterprise DNS path, and, when the current shell already has Bastion-backed Kubernetes access, the live node list, Helm add-ons, and ingress service details. `./scripts/setup.sh post` is a shorter reminder of the Bastion-backed bootstrap and post-configuration workflow if you need a quick refresher from the command line.
+`./scripts/setup.sh outputs` prints the Terraform outputs. `./scripts/setup.sh status` gives you the read-only operator view of the environment: Terraform resource names, Anyscale cloud metadata, Azure AKS state, node pool state, enterprise DNS path, and, when the current shell already has Bastion-backed Kubernetes access, the live node list, Helm add-ons, and ingress service details. `./scripts/setup.sh health` is the bounded active-check wrapper when you want the script to verify Bastion access, Anyscale control-plane reachability, workspace registration, and the currently running workspace heads instead of only printing status. `./scripts/setup.sh post` is a shorter reminder of the Bastion-backed bootstrap and post-configuration workflow if you need a quick refresher from the command line.
+
+## Troubleshooting toolchain
+
+`docs/TROUBLESHOOTING.md` is the running transcript for the May 2026 operational troubleshooting session. The notes below focus on how the extra tools were installed locally, what they are for, and how they were used against this private AKS deployment.
+
+### AKS MCP for Copilot Chat and GitHub CLI
+
+`aks-mcp` exposes AKS-aware MCP tools so Copilot Chat, the `copilot` CLI, and `gh copilot` can inspect AKS metadata and cluster-adjacent state without relying only on ad hoc shell commands.
+
+Install the macOS `darwin-arm64` release binary somewhere on `PATH`:
+
+```bash
+curl -L -o "$TMPDIR/aks-mcp.tar.gz" \
+   https://github.com/Azure/aks-mcp/releases/download/v0.0.17/aks-mcp-darwin-arm64.tar.gz
+tar -xzf "$TMPDIR/aks-mcp.tar.gz" -C "$TMPDIR"
+install "$TMPDIR/aks-mcp-darwin-arm64/aks-mcp" /opt/homebrew/bin/aks-mcp
+```
+
+This repository intentionally gitignores the local MCP client configuration files, so create them only on your workstation. Copilot Chat in VS Code reads `.vscode/mcp.json` and the `copilot` / `gh copilot` CLIs read `.mcp.json`.
+
+```json
+{
+   "servers": {
+      "aks": {
+         "type": "stdio",
+         "command": "aks-mcp",
+         "args": ["--transport", "stdio"]
+      }
+   }
+}
+```
+
+```json
+{
+   "mcpServers": {
+      "aks": {
+         "type": "stdio",
+         "command": "aks-mcp",
+         "args": ["--transport", "stdio"],
+         "tools": ["*"]
+      }
+   }
+}
+```
+
+Verify the local registration with:
+
+```bash
+copilot mcp get aks
+gh copilot -- mcp get aks
+```
+
+### AKS Agentic CLI
+
+The preview `aks-agent` Azure CLI extension is the Azure-native agent surface for AKS diagnostics and guided investigation flows.
+
+```bash
+az extension add --name aks-agent --upgrade
+az aks agent --help
+```
+
+During this validation session the extension installed cleanly and the command surface was available, but Docker was not installed on the local macOS workstation, so the containerized client mode was not exercised further.
+
+### Inspektor Gadget
+
+Inspektor Gadget adds live Kubernetes and kernel troubleshooting helpers such as process snapshots, DNS inspection, and network tracing. In this repository it was used through the Bastion-backed kubeconfig, so every cluster-facing command should start from a shell that already exported the private access path:
+
+```bash
+eval "$(./scripts/setup.sh kubeconfig-bastion --export)"
+```
+
+Install `krew` if needed, then install and deploy the gadget plugin:
+
+```bash
+kubectl krew install gadget
+kubectl-gadget deploy --timeout 4m
+```
+
+In this environment the direct `kubectl-gadget` binary under `$HOME/.krew/bin/` was more reliable than plugin discovery through `kubectl gadget`, so prefer the direct command when you want reproducible output.
 
 ## Tear the environment down
 
@@ -435,4 +517,4 @@ The two current non-blocking caveats are worth knowing before you rely on the en
 
 ## Supporting notes
 
-`docs/current-state.md` keeps the longer engineering notes behind the validated deployment sequence. `VALIDATION.md` remains as a compatibility pointer to this README. `ANYSCALE-DOCS-FEEDBACK.md` records the public-docs gaps that surfaced while validating this private AKS workflow.
+`docs/current-state.md` keeps the longer engineering notes behind the validated deployment sequence. `docs/TROUBLESHOOTING.md` records the troubleshooting transcript, tool installation flow, and the declarative CPU workspace findings from the latest investigation. `VALIDATION.md` remains as a compatibility pointer to this README. `ANYSCALE-DOCS-FEEDBACK.md` records the public-docs gaps that surfaced while validating this private AKS workflow.
