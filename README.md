@@ -264,13 +264,12 @@ Once the operator patch is in place, register the dedicated CPU and GPU workspac
 ./scripts/setup.sh anyscale-workspaces-register
 ```
 
-`anyscale-workspaces-register` is idempotent. It re-runs `anyscale-workspace-ready`, ensures the AKS-compatible **declarative** compute configs `aks-cpu` (head `CPU: 8 / memory: 32Gi` on `agentpool: cpu`, worker `cpu-workers` → same shape, 0–1 nodes) and `aks-gpu` (CPU head on `agentpool: cpu`, worker `gpu-workers` → `CPU: 8 / GPU: 1 / memory: 32Gi` on `agentpool: gput4`, 0–1 nodes) exist, then registers two workspaces against those configs. Each worker group uses `required_resources` instead of named instance types, so the operator dynamically generates pod shapes and the AKS scheduler places them on the matching node pool via the embedded `advanced_instance_config.spec.nodeSelector`/`tolerations`. The command refreshes any stale compute-config versions that still reference legacy named instance types and updates stopped or errored workspaces to the latest compute-config version:
+`anyscale-workspaces-register` is idempotent. It re-runs `anyscale-workspace-ready`, ensures the AKS-compatible **declarative** compute configs `aks-cpu` (head `CPU: 8 / memory: 32Gi` on `agentpool: cpu`, worker `cpu-workers` → same shape, 1–1 nodes) and `aks-gpu` (CPU head on `agentpool: cpu`, worker `gpu-workers` → `CPU: 8 / GPU: 1 / memory: 32Gi` on `agentpool: gput4`, 1–1 nodes) exist, then registers two workspaces against those configs. Each worker group uses `required_resources` instead of named instance types, so the operator dynamically generates pod shapes and the AKS scheduler places them on the matching node pool via the embedded `advanced_instance_config.spec.nodeSelector`/`tolerations`. The command refreshes any stale compute-config versions that still reference legacy named instance types or the older scale-from-zero worker settings, updates the sample workspaces to the latest compute-config version, starts both workspaces, and validates that their warm workers are online on the expected AKS pools:
 
-- `aks-cpu-workspace` — started automatically and waited until `RUNNING`. The helper then performs a fast structural check: it looks up the Ray head pod and confirms it is scheduled on an `aks-cpu-*` node. It deliberately does **not** run an in-script Ray task, because the head pod publishes `0` schedulable Ray `CPU` resources and the `cpu-workers` group autoscales from `0`; a `num_cpus=1` Ray task therefore blocks on autoscaling that may take several minutes or stall. Run the Ray CPU probe interactively (see the manual validation section below) instead.
-- `aks-cpu-workspace` — started automatically and waited until `RUNNING`. The helper then performs a fast structural check: it looks up the Ray head pod and confirms it is scheduled on an `aks-cpu-*` node. It deliberately does **not** run an in-script Ray task, because the head pod publishes `0` schedulable Ray `CPU` resources and the `cpu-workers` group autoscales from `0`; a `num_cpus=1` Ray task therefore blocks on autoscaling that may take several minutes or stall. Run the Ray CPU probe interactively (see the manual validation section below) instead. On a cold workspace the first `num_cpus=1` submission can still time out while the new `cpu-workers` pod finishes joining Ray; rerun the same probe after `ray status` shows an idle `cpu-workers` node.
-- `aks-gpu-workspace` — **registered only**. The helper does not start it, which keeps the GPU node pool scaled to its baseline until you actually need GPU capacity. Start it manually from the Anyscale console when you are ready to run a GPU workload.
+- `aks-cpu-workspace` — started automatically, waited until `RUNNING`, confirmed that the Ray head pod was scheduled on an `aks-cpu-*` node, and confirmed that a warm `cpu-workers` pod was running on the CPU pool.
+- `aks-gpu-workspace` — started automatically, waited until `RUNNING`, confirmed that the Ray head pod was scheduled on an `aks-cpu-*` node, and confirmed that a warm `gpu-workers` pod was running on an `aks-gput4-*` node.
 
-Existing compute configs and workspaces with the same names are reused, so this command is safe to re-run. Generated compute-config YAML and command logs are written under `.cache/` (for example `.cache/anyscale-compute.aks-cpu.yaml`, `.cache/aks-cpu-workspace.validate.log`, `.cache/aks-gpu-workspace.create.log`).
+Existing compute configs and workspaces with the same names are reused, so this command is safe to re-run. When the generated compute-config version changes, the helper reconciles the sample workspaces to that newer version before starting them again. Generated compute-config YAML and command logs are written under `.cache/` (for example `.cache/anyscale-compute.aks-cpu.yaml`, `.cache/aks-cpu-workspace.validate.log`, `.cache/aks-gpu-workspace.validate.log`, `.cache/aks-gpu-workspace.start.log`).
 
 If the Anyscale console **Create** flow fails on this manually registered AKS cloud with `Failed to find compute config template for AZURE`, that is not a missing `deploy-part2` step in this repository. The backend workspace-create path is healthy; the same cloud accepts `workspace_v2 create` calls against the registered `aks-cpu` and `aks-gpu` compute configs. Use the repo wrapper below as the supported workaround for creating additional workspaces:
 
@@ -293,15 +292,13 @@ eval "$(./scripts/setup.sh kubeconfig-bastion --export)"
 ./scripts/setup.sh anyscale-workspaces-runtime-proof gpu-probe
 ```
 
-`start-gpu` starts `aks-gpu-workspace` and treats an already `STARTING` or `RUNNING` workspace as success. `wait-gpu` polls `anyscale workspace_v2 status` until the workspace reaches `RUNNING`, fails fast on terminal failure states, and stops after the configured attempt budget. `gpu-probe` confirms the GPU head pod is scheduled on an `aks-gput4-*` node, runs `nvidia-smi -L`, and then runs a Ray task with `num_gpus=1` that must emit `GPU_WORKSPACE_OK`.
+`start-gpu` starts `aks-gpu-workspace` and treats an already `STARTING` or `RUNNING` workspace as success. `wait-gpu` polls `anyscale workspace_v2 status` until the workspace reaches `RUNNING`, fails fast on terminal failure states, and stops after the configured attempt budget. `gpu-probe` confirms the GPU workspace head is reachable, runs `nvidia-smi -L`, and then runs a Ray task with `num_gpus=1` that must emit `GPU_WORKSPACE_OK` from a worker scheduled on an `aks-gput4-*` node.
 
-For convenience, `./scripts/setup.sh anyscale-workspaces-runtime-proof all` runs those three GPU steps in order. It deliberately does not run the CPU Ray probe, because the CPU workspace's head pod advertises `0` schedulable Ray CPU resources and the `cpu-workers` group autoscales from zero. If you want the bounded optional CPU check anyway, run it as a separate step:
+For convenience, `./scripts/setup.sh anyscale-workspaces-runtime-proof all` runs those three GPU steps in order. The bounded CPU proof remains available as a separate command when you want to re-check on-cluster CPU execution explicitly:
 
 ```bash
 ./scripts/setup.sh anyscale-workspaces-runtime-proof cpu-probe --command-timeout-seconds 600
 ```
-
-If that first CPU probe times out on a cold workspace, check `ray status` from the head pod and rerun once the `cpu-workers` group appears as idle. In the validated AKS sample, the warmed-up retry returned `CPU_WORKSPACE_OK` without any compute-config or toleration changes.
 
 Generated logs are written under `.cache/`, including `.cache/aks-gpu-workspace.runtime.wait.log`, `.cache/aks-gpu-workspace.nvidia-smi.log`, `.cache/aks-gpu-workspace.ray-gpu.log`, and `.cache/aks-cpu-workspace.ray-cpu.log`.
 
@@ -319,7 +316,7 @@ If you already created `aks-gpu-workspace` before the compute config was refresh
 After `anyscale-workspaces-register` completes, run the GPU proof by hand. This avoids the long `STARTING → RUNNING` wait on every script run and lets you exercise the console flow the way an Anyscale user would.
 
 1. Open the Anyscale console at `https://console.azure.anyscale.com`, switch to the cloud whose name matches `ANYSCALE_CLOUD_NAME` from `.env`, and confirm that both compute configs `aks-cpu` and `aks-gpu` are listed and active.
-2. Open the **Workspaces** view and confirm that `aks-cpu-workspace` is `RUNNING` and that `aks-gpu-workspace` exists in a stopped state.
+2. Open the **Workspaces** view and confirm that both `aks-cpu-workspace` and `aks-gpu-workspace` are `RUNNING` after `anyscale-workspaces-register` completes.
 3. Open `aks-cpu-workspace` and run a small Ray CPU task in a notebook or terminal, for example:
 
    ```python
@@ -333,9 +330,9 @@ After `anyscale-workspaces-register` completes, run the GPU proof by hand. This 
    print(ray.get(probe.remote()))
    ```
 
-   This mirrors the automated check the script already ran and proves the CPU workspace is interactively usable.
-4. Open `aks-gpu-workspace` and click **Start**. The first start can take roughly six minutes while the GPU node pool scales up from its baseline and the GPU head pod is scheduled; that is expected and is not a hang.
-5. When the GPU workspace reaches `RUNNING`, open a terminal in the workspace and confirm GPU visibility:
+   This complements the structural validation the script already ran and proves the CPU workspace is interactively usable.
+4. If you previously stopped `aks-gpu-workspace` to save cost, start it again and wait for it to return to `RUNNING`.
+5. Open a terminal in the GPU workspace and confirm GPU visibility:
 
    ```bash
    nvidia-smi -L
@@ -356,16 +353,16 @@ After `anyscale-workspaces-register` completes, run the GPU proof by hand. This 
    ```
 
    The task should return `0` (or another non-`none` device index), proving Ray scheduled a GPU-pinned task on the GPU node pool.
-6. From a Bastion-backed shell, confirm the workspace head pods are scheduled on the intended AKS pools:
+6. From a Bastion-backed shell, confirm the workspace heads and workers are scheduled on the intended AKS pools:
 
    ```bash
    eval "$(./scripts/setup.sh kubeconfig-bastion --export)"
-   kubectl get pods -n anyscale-operator -l ray-node-type=head -o wide
+   kubectl get pods -n anyscale-operator -l 'app.kubernetes.io/name in (aks-cpu-workspace,aks-gpu-workspace)' -o wide
    ```
 
-   The `aks-cpu-workspace` head pod's node name should start with `aks-cpu-`, and once the GPU workspace is running its head pod's node name should start with `aks-gput4-`.
+   Both workspace head pods should run on `aks-cpu-*` nodes, the `aks-cpu-workspace` worker pod should run on an `aks-cpu-*` node, and the `aks-gpu-workspace` worker pod should run on an `aks-gput4-*` node.
 
-When you are done, you can stop `aks-gpu-workspace` from the Anyscale console so the GPU node pool scales back down. `aks-cpu-workspace` is safe to leave running as the always-on CPU entrypoint.
+When you are done, you can stop `aks-gpu-workspace` from the Anyscale console if you want the GPU node pool to scale back down. `aks-cpu-workspace` is safe to leave running as the always-on CPU entrypoint.
 
 ## Validate the codebase and the deployed environment
 
@@ -402,7 +399,7 @@ This repository provisions its own AKS cluster today, but the same integration p
 - The phase-2 ARM and Terraform flow completes without manual portal repair work, and the Azure-native Anyscale cloud resource plus the `anyscaleoperator` AKS extension both reach `Succeeded`.
 - `./scripts/setup.sh anyscale-workspace-ready` succeeds, the live operator release accepts the token patch, and the resulting `instance-types` ConfigMap contains at least one CPU-only instance type and one GPU-backed instance type that map cleanly to the CPU and GPU pools.
 - `./scripts/setup.sh validate-focused`, `./scripts/setup.sh validate-k8s`, and `./scripts/setup.sh control-plane-egress-smoke` all pass, proving private API access, firewall-routed egress, Workload Identity storage access, internal ingress reachability, and GPU scheduling.
-- `./scripts/setup.sh anyscale-workspaces-register` succeeds: it registers the `aks-cpu` and `aks-gpu` compute configs, registers `aks-cpu-workspace` and `aks-gpu-workspace`, starts the CPU workspace, waits until it reaches `RUNNING`, and confirms the CPU head pod is scheduled on the `aks-cpu` node pool.
+- `./scripts/setup.sh anyscale-workspaces-register` succeeds: it registers the `aks-cpu` and `aks-gpu` compute configs, registers `aks-cpu-workspace` and `aks-gpu-workspace`, starts both workspaces, waits until they reach `RUNNING`, confirms both heads are on the CPU pool, and confirms warm CPU and GPU worker pods are online on the expected node pools.
 - A console session against `aks-cpu-workspace` runs a small Ray CPU task on the CPU pool using the CPU-only instance type.
 - After starting `aks-gpu-workspace` from the bounded CLI proof or the Anyscale console, a console session runs a small Ray GPU task on the GPU pool, with `nvidia-smi -L` reporting a `Tesla T4` and the Ray task returning a valid `CUDA_VISIBLE_DEVICES` value.
 - The end-to-end path is repeatable: re-running `./scripts/setup.sh anyscale-workspaces-register` reuses the existing compute configs and workspaces without recreating them, and the manual GPU validation can be repeated through the console without reworking the underlying AKS, Bastion, identity, or operator wiring by hand.
@@ -411,9 +408,9 @@ This repository provisions its own AKS cluster today, but the same integration p
 
 `./scripts/setup.sh outputs` prints the Terraform outputs. `./scripts/setup.sh status` gives you the read-only operator view of the environment: Terraform resource names, Anyscale cloud metadata, Azure AKS state, node pool state, enterprise DNS path, and, when the current shell already has Bastion-backed Kubernetes access, the live node list, Helm add-ons, and ingress service details. `./scripts/setup.sh health` is the bounded active-check wrapper when you want the script to verify Bastion access, Anyscale control-plane reachability, workspace registration, and the currently running workspace heads instead of only printing status. `./scripts/setup.sh post` is a shorter reminder of the Bastion-backed bootstrap and post-configuration workflow if you need a quick refresher from the command line.
 
-## Troubleshooting toolchain
+## Operational tooling
 
-`docs/TROUBLESHOOTING.md` is the running transcript for the May 2026 operational troubleshooting session. The notes below focus on how the extra tools were installed locally, what they are for, and how they were used against this private AKS deployment.
+The notes below focus on how the extra tools were installed locally, what they are for, and how they were used against this private AKS deployment. Keep one-off session transcripts or detailed operator notes in a local root `ISSUES.md`; that file is gitignored in this repository.
 
 ### AKS MCP for Copilot Chat and GitHub CLI
 
@@ -517,4 +514,4 @@ The two current non-blocking caveats are worth knowing before you rely on the en
 
 ## Supporting notes
 
-`docs/current-state.md` keeps the longer engineering notes behind the validated deployment sequence. `docs/TROUBLESHOOTING.md` records the troubleshooting transcript, tool installation flow, and the declarative CPU workspace findings from the latest investigation. `VALIDATION.md` remains as a compatibility pointer to this README. `ANYSCALE-DOCS-FEEDBACK.md` records the public-docs gaps that surfaced while validating this private AKS workflow.
+`docs/current-state.md` keeps the longer engineering notes behind the validated deployment sequence. `VALIDATION.md` remains as a compatibility pointer to this README. `ANYSCALE-DOCS-FEEDBACK.md` records the public-docs gaps that surfaced while validating this private AKS workflow.
