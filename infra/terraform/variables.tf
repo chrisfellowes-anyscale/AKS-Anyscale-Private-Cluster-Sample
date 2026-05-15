@@ -293,6 +293,13 @@ variable "anyscale_operator_namespace" {
   type        = string
 }
 
+variable "anyscale_cli_token" {
+  description = "Anyscale CLI token for the operator (global.auth.anyscaleCliToken). Stored as an AKS extension protected setting (encrypted at rest, not visible in az k8s-extension show). Leave null to install the extension without the secret; the operator will surface auth handshake failures until the token is provided."
+  type        = string
+  default     = null
+  sensitive   = true
+}
+
 variable "anyscale_operator_serviceaccount" {
   description = "Kubernetes service account name for the Anyscale operator."
   type        = string

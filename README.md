@@ -164,6 +164,89 @@ kubectl get nodes -o wide
 
 This is the path the repo uses for local `kubectl`, `helm`, `./scripts/setup.sh anyscale-workspace-ready`, `./scripts/setup.sh anyscale-workspaces-register`, `./scripts/setup.sh validate-focused`, and `./scripts/setup.sh validate-k8s`. `./scripts/setup.sh bastion-tunnel status` tells you whether the local listener is already running, `./scripts/setup.sh bastion-tunnel stop` shuts it down, and `./scripts/setup.sh kubeconfig-bastion --admin --export` is the break-glass admin variant.
 
+## Reach a private workspace from a local browser
+
+The Bastion tunnel only solves local access to the private AKS API. It does not make the private Anyscale session hostnames resolvable or reachable from a browser on this machine by itself. The temporary workaround in this repository now uses a separate Firefox profile plus a Firefox-only local PAC/proxy path, which avoids touching `/etc/hosts` and avoids affecting other Edge or Chrome instances on the Mac.
+
+On this machine, Firefox is available at `/Volumes/External SSD/Apps/Firefox.app`, and `workspace-browser-open` launches that Firefox binary with a disposable profile under `.cache/aks-anyscale-sample-harness/workspace-browser-profile`.
+
+The shortest browser-path command is the wrapper below, which starts or reuses the Bastion tunnel, writes a Bastion-backed kubeconfig, starts the local ingress tunnel, starts a tiny local proxy that only the temporary Firefox profile uses, and launches that disposable Firefox profile:
+
+```bash
+./scripts/setup.sh workspace-browser-open --session-id ses_xxx
+```
+
+By default, `workspace-browser-open` uses Bastion port `64435`, forwards `ingress-nginx-controller` to `127.0.0.1:18081` and `127.0.0.1:18443`, and starts a Firefox-only proxy on `127.0.0.1:18777` with a generated PAC file at `.cache/aks-anyscale-sample-harness/workspace-browser-proxy.pac`. Only the disposable Firefox profile uses that proxy path. Firefox is launched into `https://console.azure.anyscale.com/cluster_auth/<session>?relay_state=...` with an explicit relay state that points back to `https://session-<id>.i.azure.anyscaleuserdata.com/`, so the auth flow does not depend on the session page's hidden auto-submit behavior.
+
+At the time of writing, that browser path is still blocked by an Anyscale-side auth failure after the Microsoft Entra callback. The local Firefox/PAC workaround does reach the auth gateway correctly, but `console.azure.anyscale.com/api/v2/authentication/<session>/cluster` is currently returning `400 Invalid host: login.microsoftonline.com for cluster: <session>` instead of minting cluster-scoped credentials. Keep `workspace-browser-open` for reproducing the issue or collecting fresh HARs, not as the primary way to get into a running private session.
+
+For a live session, the expected probe pattern is `308` on HTTP and `401` on HTTPS before you authenticate, which proves that host-based routing and the auth gateway are reachable locally even though the cluster itself stays private.
+
+If you need non-default ports, you can override them explicitly:
+
+```bash
+./scripts/setup.sh workspace-browser-open --session-id ses_xxx --browser firefox --bastion-port 64435 --http-port 18081 --https-port 18443
+```
+
+When you no longer need the temporary browser and network path, stop them with:
+
+```bash
+./scripts/setup.sh workspace-browser-open stop
+```
+
+If you only want to close the separate browser profile and keep the Bastion/browser tunnel running, use:
+
+```bash
+./scripts/setup.sh workspace-browser-open stop --keep-network
+```
+
+The browser launcher reuses the network wrapper below under the hood. If you prefer to manage the network path yourself, this command starts or reuses the Bastion tunnel, writes the Bastion-backed kubeconfig, and starts the local ingress tunnel without launching a browser:
+
+```bash
+./scripts/setup.sh workspace-browser-ready --session-id ses_xxx
+```
+
+That network-only wrapper is equivalent to the manual three-command sequence below:
+
+```bash
+./scripts/setup.sh bastion-tunnel start --port 64435
+eval "$(./scripts/setup.sh kubeconfig-bastion --export)"
+./scripts/setup.sh workspace-browser-tunnel start --session-id ses_xxx
+```
+
+If you use `anyscale cluster network_debug` from this Mac, be aware that the private `session-*.i.azure.anyscaleuserdata.com` hostname will not resolve locally without the workaround above, and local `HTTP_PROXY` or `HTTPS_PROXY` settings can add a second proxy-related failure on top of the real private-DNS miss.
+
+For practical local access while `cluster_auth` is broken, use the direct head-service forward instead:
+
+```bash
+./scripts/setup.sh workspace-head-forward --session-id ses_xxx
+```
+
+That command starts or reuses the Bastion tunnel, exports the Bastion-backed kubeconfig, and port-forwards the live `ses-...-head` service directly to localhost. By default it exposes the Ray Dashboard on `http://127.0.0.1:18265/` and also forwards the session service HTTP port to `http://127.0.0.1:18080/`.
+
+In the current environment, `http://127.0.0.1:18265/` is the usable fallback because it returns the Ray Dashboard directly, while `http://127.0.0.1:18080/` still sits behind the Anyscale auth gate and returns `401 Unauthorized` until the upstream auth bug is fixed.
+
+If you want the same disposable Firefox flow but pointed at the working Ray Dashboard fallback instead of `cluster_auth`, use:
+
+```bash
+./scripts/setup.sh workspace-head-open --session-id ses_xxx
+```
+
+That command reuses the managed head-service forward and launches the temporary Firefox profile directly to `http://127.0.0.1:18265/`, so you do not need to copy the local URL by hand.
+
+You can inspect or stop that managed forward with:
+
+```bash
+./scripts/setup.sh workspace-head-forward status
+./scripts/setup.sh workspace-head-forward stop
+```
+
+To close only the temporary Firefox profile but keep the direct forward running, use:
+
+```bash
+./scripts/setup.sh workspace-head-open stop --keep-forward
+```
+
 ## Patch the Anyscale operator and register the CPU and GPU workspaces
 
 If phase 2 did not auto-run the operator patch, start from a shell that already has Bastion-backed access and run the helper directly.
@@ -181,7 +264,7 @@ Once the operator patch is in place, register the dedicated CPU and GPU workspac
 ./scripts/setup.sh anyscale-workspaces-register
 ```
 
-`anyscale-workspaces-register` is idempotent. It re-runs `anyscale-workspace-ready`, ensures the AKS-compatible compute configs `aks-cpu` (head `8CPU-32GB`, worker `cpu-workers` → `8CPU-32GB`, 0–1 nodes) and `aks-gpu` (head `8CPU-32GB-1xT4`, worker `gpu-workers` → `8CPU-32GB-1xT4`, 0–1 nodes) exist, then registers two workspaces against those configs. The command refreshes stale compute-config versions that still reference the earlier custom `*-AKS` instance type names and updates stopped or errored workspaces to the latest compute-config version:
+`anyscale-workspaces-register` is idempotent. It re-runs `anyscale-workspace-ready`, ensures the AKS-compatible **declarative** compute configs `aks-cpu` (head `CPU: 8 / memory: 32Gi` on `agentpool: cpu`, worker `cpu-workers` → same shape, 0–1 nodes) and `aks-gpu` (CPU head on `agentpool: cpu`, worker `gpu-workers` → `CPU: 8 / GPU: 1 / memory: 32Gi` on `agentpool: gput4`, 0–1 nodes) exist, then registers two workspaces against those configs. Each worker group uses `required_resources` instead of named instance types, so the operator dynamically generates pod shapes and the AKS scheduler places them on the matching node pool via the embedded `advanced_instance_config.spec.nodeSelector`/`tolerations`. The command refreshes any stale compute-config versions that still reference legacy named instance types and updates stopped or errored workspaces to the latest compute-config version:
 
 - `aks-cpu-workspace` — started automatically and waited until `RUNNING`. The helper then performs a fast structural check: it looks up the Ray head pod and confirms it is scheduled on an `aks-cpu-*` node. It deliberately does **not** run an in-script Ray task, because the head pod publishes `0` schedulable Ray `CPU` resources and the `cpu-workers` group autoscales from `0`; a `num_cpus=1` Ray task therefore blocks on autoscaling that may take several minutes or stall. Run the Ray CPU probe interactively (see the manual validation section below) instead.
 - `aks-gpu-workspace` — **registered only**. The helper does not start it, which keeps the GPU node pool scaled to its baseline until you actually need GPU capacity. Start it manually from the Anyscale console when you are ready to run a GPU workload.

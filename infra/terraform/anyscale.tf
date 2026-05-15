@@ -17,6 +17,7 @@ locals {
     "workloads.accelerator.tolerations.default[1].key"      = "nvidia.com/gpu"
     "workloads.accelerator.tolerations.default[1].operator" = "Exists"
     "workloads.accelerator.tolerations.default[1].effect"   = "NoSchedule"
+    "workloads.instanceTypes.enableDefaults"                = "true"
   }
   anyscale_platform_extension_configuration_settings = merge(
     local.anyscale_platform_extension_configuration_defaults,
@@ -160,6 +161,10 @@ resource "azurerm_kubernetes_cluster_extension" "anyscale_operator" {
     },
     local.anyscale_platform_extension_configuration_settings,
   )
+
+  configuration_protected_settings = var.anyscale_cli_token == null ? {} : {
+    "global.auth.anyscaleCliToken" = var.anyscale_cli_token
+  }
 
   depends_on = [
     module.cluster_bootstrap,

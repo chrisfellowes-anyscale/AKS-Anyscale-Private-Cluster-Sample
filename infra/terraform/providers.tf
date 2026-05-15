@@ -16,4 +16,7 @@ provider "kubernetes" {
 
 provider "helm" {
   alias = "bootstrap"
+  kubernetes = {
+    config_path = local.cluster_bootstrap_kubeconfig_path
+  }
 }

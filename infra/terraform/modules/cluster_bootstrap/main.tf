@@ -110,6 +110,14 @@ resource "kubernetes_service_account_v1" "anyscale_operator" {
     annotations = local.service_account_annotations
   }
 
+  lifecycle {
+    ignore_changes = [
+      metadata[0].labels["app.kubernetes.io/instance"],
+      metadata[0].labels["app.kubernetes.io/name"],
+      metadata[0].labels["helm.sh/chart"],
+    ]
+  }
+
   depends_on = [kubernetes_namespace_v1.operator]
 }
 

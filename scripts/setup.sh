@@ -17,10 +17,15 @@
 #   ./scripts/setup.sh bastion-tunnel start [--port 64430] # run a reusable Bastion tunnel to the private AKS API
 #   ./scripts/setup.sh kubeconfig  # fetch Entra kubeconfig + kubelogin conversion
 #   ./scripts/setup.sh kubeconfig-bastion [--admin] [--export] # write kubeconfig pointed at the Bastion tunnel
-#   ./scripts/setup.sh anyscale-workspace-ready # patch the operator with the Azure CLI token and AKS instance types
+#   ./scripts/setup.sh workspace-head-forward --session-id ses_xxx # start a direct head-service port-forward for the Ray Dashboard
+#   ./scripts/setup.sh workspace-head-open --session-id ses_xxx # launch a temporary Firefox profile directly to the Ray Dashboard fallback
+#   ./scripts/setup.sh workspace-browser-ready --session-id ses_xxx # start or reuse Bastion + kubeconfig + local browser tunnel in one command
+#   ./scripts/setup.sh workspace-browser-open --session-id ses_xxx # launch a temporary separate Firefox profile with no host-file changes
+#   ./scripts/setup.sh workspace-browser-tunnel start --session-id ses_xxx # forward private session ingress to localhost for a browser on this Mac
 #   ./scripts/setup.sh anyscale-workspace-create --name my-workspace [--compute-config aks-cpu|aks-gpu] [--start] # create an extra workspace through the CLI path
 #   ./scripts/setup.sh anyscale-workspaces-register # register aks-cpu/aks-gpu compute configs and aks-cpu-workspace/aks-gpu-workspace; start+validate CPU only
 #   ./scripts/setup.sh anyscale-workspaces-runtime-proof start-gpu|wait-gpu|gpu-probe|cpu-probe|all # bounded runtime proof steps
+#   ./scripts/setup.sh smoke-gpu   # opt-in: start GPU workspace + Ray num_gpus=1 probe (alias for runtime-proof all)
 #   ./scripts/setup.sh post        # explain the Terraform-managed Kubernetes bootstrap flow
 #   ./scripts/setup.sh control-plane-egress-smoke # prove cluster egress to Anyscale control-plane endpoints
 #   ./scripts/setup.sh validate-focused [--skip-observability] # run the live validation suite with pass/fail output
@@ -340,6 +345,11 @@ render_tfvars() {
   normalize_gpu_pool_configs_min_count
   sync_anyscale_cli_env
 
+  if [[ -z "${TF_VAR_anyscale_cli_token:-}" && -n "${ANYSCALE_CLI_TOKEN:-}" ]]; then
+    TF_VAR_anyscale_cli_token="${ANYSCALE_CLI_TOKEN}"
+    export TF_VAR_anyscale_cli_token
+  fi
+
   jq -n \
     --arg azure_subscription_id "${TF_VAR_azure_subscription_id}" \
     --arg azure_tenant_id "${TF_VAR_azure_tenant_id}" \
@@ -383,6 +393,7 @@ render_tfvars() {
     --argjson container_insights_namespaces "${TF_VAR_container_insights_namespaces}" \
     --argjson terraform_managed_diagnostic_settings_enabled "${TF_VAR_terraform_managed_diagnostic_settings_enabled}" \
     --argjson tags "${TF_VAR_tags}" \
+    --arg anyscale_cli_token "${TF_VAR_anyscale_cli_token:-}" \
     '{
       azure_subscription_id: $azure_subscription_id,
       azure_tenant_id: $azure_tenant_id,
@@ -425,7 +436,8 @@ render_tfvars() {
       container_insights_streams: $container_insights_streams,
       container_insights_namespaces: $container_insights_namespaces,
       terraform_managed_diagnostic_settings_enabled: $terraform_managed_diagnostic_settings_enabled,
-      tags: $tags
+      tags: $tags,
+      anyscale_cli_token: (if $anyscale_cli_token == "" then null else $anyscale_cli_token end)
     }' > "${GENERATED_TFVARS}"
 
   log "Rendered ${GENERATED_TFVARS}"
@@ -534,6 +546,91 @@ bastion_tunnel_logfile() {
   harness_state_file "bastion-tunnel.log"
 }
 
+workspace_browser_tunnel_pidfile() {
+  harness_state_file "workspace-browser-tunnel.pid"
+}
+
+workspace_browser_tunnel_http_portfile() {
+  harness_state_file "workspace-browser-tunnel.http-port"
+}
+
+workspace_browser_tunnel_https_portfile() {
+  harness_state_file "workspace-browser-tunnel.https-port"
+}
+
+workspace_browser_tunnel_hostfile() {
+  harness_state_file "workspace-browser-tunnel.host"
+}
+
+workspace_browser_tunnel_logfile() {
+  harness_state_file "workspace-browser-tunnel.log"
+}
+
+workspace_head_forward_pidfile() {
+  harness_state_file "workspace-head-forward.pid"
+}
+
+workspace_head_forward_dashboard_portfile() {
+  harness_state_file "workspace-head-forward.dashboard-port"
+}
+
+workspace_head_forward_http_portfile() {
+  harness_state_file "workspace-head-forward.http-port"
+}
+
+workspace_head_forward_sessionfile() {
+  harness_state_file "workspace-head-forward.session"
+}
+
+workspace_head_forward_logfile() {
+  harness_state_file "workspace-head-forward.log"
+}
+
+workspace_browser_app_pidfile() {
+  harness_state_file "workspace-browser-app.pid"
+}
+
+workspace_browser_app_browserfile() {
+  harness_state_file "workspace-browser-app.browser"
+}
+
+workspace_browser_app_urlfile() {
+  harness_state_file "workspace-browser-app.url"
+}
+
+workspace_browser_app_hostfile() {
+  harness_state_file "workspace-browser-app.host"
+}
+
+workspace_browser_app_logfile() {
+  harness_state_file "workspace-browser-app.log"
+}
+
+workspace_browser_proxy_pidfile() {
+  harness_state_file "workspace-browser-proxy.pid"
+}
+
+workspace_browser_proxy_portfile() {
+  harness_state_file "workspace-browser-proxy.port"
+}
+
+workspace_browser_proxy_logfile() {
+  harness_state_file "workspace-browser-proxy.log"
+}
+
+workspace_browser_proxy_pacfile() {
+  harness_state_file "workspace-browser-proxy.pac"
+}
+
+workspace_browser_proxy_script_path() {
+  harness_state_file "workspace-browser-proxy.py"
+}
+
+workspace_browser_profile_dir() {
+  ensure_harness_dir
+  printf '%s/workspace-browser-profile\n' "${HARNESS_DIR}"
+}
+
 bastion_kubeconfig_path() {
   harness_state_file "kubeconfig.bastion"
 }
@@ -627,6 +724,31 @@ port_listeners_are_bastion_tunnels() {
   [[ "${found}" == true ]]
 }
 
+pid_is_workspace_browser_tunnel() {
+  local pid="$1"
+  local command_line
+
+  command_line="$(pid_command_line "${pid}")"
+  [[ "${command_line}" == *"kubectl"* ]] \
+    && [[ "${command_line}" == *"port-forward"* ]] \
+    && [[ "${command_line}" == *"ingress-nginx-controller"* ]]
+}
+
+port_listeners_are_workspace_browser_tunnels() {
+  local port="$1"
+  local listener_pid found=false
+
+  for listener_pid in $(listener_pids "${port}"); do
+    [[ -n "${listener_pid}" ]] || continue
+    found=true
+    if ! pid_is_workspace_browser_tunnel "${listener_pid}"; then
+      return 1
+    fi
+  done
+
+  [[ "${found}" == true ]]
+}
+
 wait_for_listener_shutdown() {
   local port="$1"
   local attempts="${2:-10}"
@@ -657,6 +779,115 @@ stop_bastion_listeners_on_port() {
 
   if [[ "${stopped}" == true ]]; then
     wait_for_listener_shutdown "${port}" 10 || true
+    return 0
+  fi
+
+  return 1
+}
+
+stop_workspace_browser_tunnel_listeners_on_port() {
+  local port="$1"
+  local listener_pid stopped=false
+
+  for listener_pid in $(listener_pids "${port}"); do
+    [[ -n "${listener_pid}" ]] || continue
+    if ! pid_is_workspace_browser_tunnel "${listener_pid}"; then
+      continue
+    fi
+    kill "${listener_pid}" 2>/dev/null || true
+    stopped=true
+  done
+
+  if [[ "${stopped}" == true ]]; then
+    wait_for_listener_shutdown "${port}" 10 || true
+    return 0
+  fi
+
+  return 1
+}
+
+workspace_browser_app_pids() {
+  local profile_dir browser_pid command_line
+
+  profile_dir="$(workspace_browser_profile_dir)"
+  for browser_pid in $(pgrep -f firefox 2>/dev/null || true); do
+    [[ -n "${browser_pid}" ]] || continue
+    command_line="$(pid_command_line "${browser_pid}")"
+    [[ "${command_line}" == *"${profile_dir}"* ]] || continue
+    printf '%s\n' "${browser_pid}"
+  done
+}
+
+workspace_browser_app_is_running() {
+  local browser_pid
+
+  for browser_pid in $(workspace_browser_app_pids); do
+    [[ -n "${browser_pid}" ]] || continue
+    return 0
+  done
+
+  return 1
+}
+
+stop_workspace_browser_app_processes() {
+  local browser_pid stopped=false
+
+  for browser_pid in $(workspace_browser_app_pids); do
+    [[ -n "${browser_pid}" ]] || continue
+    kill "${browser_pid}" 2>/dev/null || true
+    stopped=true
+  done
+
+  if [[ "${stopped}" == true ]]; then
+    sleep 1
+    for browser_pid in $(workspace_browser_app_pids); do
+      [[ -n "${browser_pid}" ]] || continue
+      kill -9 "${browser_pid}" 2>/dev/null || true
+    done
+    return 0
+  fi
+
+  return 1
+}
+
+workspace_browser_proxy_pids() {
+  local proxy_pid script_path command_line
+
+  script_path="$(workspace_browser_proxy_script_path)"
+  for proxy_pid in $(pgrep -f -- "${script_path}" 2>/dev/null || true); do
+    [[ -n "${proxy_pid}" ]] || continue
+    command_line="$(pid_command_line "${proxy_pid}")"
+    [[ "${command_line}" == *"${script_path}"* ]] || continue
+    printf '%s\n' "${proxy_pid}"
+  done
+}
+
+workspace_browser_proxy_is_running() {
+  local proxy_pid
+
+  for proxy_pid in $(workspace_browser_proxy_pids); do
+    [[ -n "${proxy_pid}" ]] || continue
+    return 0
+  done
+
+  return 1
+}
+
+stop_workspace_browser_proxy_processes() {
+  local proxy_pid stopped=false
+
+  for proxy_pid in $(workspace_browser_proxy_pids); do
+    [[ -n "${proxy_pid}" ]] || continue
+    kill "${proxy_pid}" 2>/dev/null || true
+    stopped=true
+  done
+
+  if [[ "${stopped}" == true ]]; then
+    sleep 1
+    for proxy_pid in $(workspace_browser_proxy_pids); do
+      [[ -n "${proxy_pid}" ]] || continue
+      kill -9 "${proxy_pid}" 2>/dev/null || true
+    done
     return 0
   fi
 
@@ -828,6 +1059,1355 @@ require_cluster_kubectl_access() {
   kubectl_readyz >/dev/null 2>&1 || die "kubectl cannot reach the cluster. Start a Bastion tunnel with ./scripts/setup.sh bastion-tunnel start and set KUBECONFIG via ./scripts/setup.sh kubeconfig-bastion --export."
 }
 
+workspace_browser_session_suffix() {
+  local value="${1:-}"
+
+  [[ -n "${value}" ]] || die "A session id or session host is required."
+
+  value="${value#https://}"
+  value="${value#http://}"
+  value="${value%%/*}"
+
+  case "${value}" in
+    session-*.i.azure.anyscaleuserdata.com)
+      value="${value#session-}"
+      value="${value%%.i.azure.anyscaleuserdata.com}"
+      ;;
+    vscode-session-*.i.azure.anyscaleuserdata.com)
+      value="${value#vscode-session-}"
+      value="${value%%.i.azure.anyscaleuserdata.com}"
+      ;;
+    serve-session-*.i.azure.anyscaleuserdata.com)
+      value="${value#serve-session-}"
+      value="${value%%.i.azure.anyscaleuserdata.com}"
+      ;;
+  esac
+
+  case "${value}" in
+    ses_*) value="${value#ses_}" ;;
+    ses-*) value="${value#ses-}" ;;
+  esac
+
+  value="${value//_/-}"
+  [[ -n "${value}" ]] || die "Could not derive a session suffix from '${1}'."
+  printf '%s\n' "${value}"
+}
+
+workspace_browser_primary_host() {
+  local session_suffix="$1"
+  printf 'session-%s.i.azure.anyscaleuserdata.com\n' "${session_suffix}"
+}
+
+workspace_browser_session_id() {
+  local value="${1:-}"
+  local session_suffix
+
+  [[ -n "${value}" ]] || die "A session id or session host is required."
+
+  case "${value}" in
+    ses_*)
+      printf '%s\n' "${value}"
+      return 0
+      ;;
+    ses-*)
+      printf 'ses_%s\n' "${value#ses-}"
+      return 0
+      ;;
+  esac
+
+  session_suffix="$(workspace_browser_session_suffix "${value}")"
+  printf 'ses_%s\n' "${session_suffix//-/_}"
+}
+
+workspace_browser_hosts_entry() {
+  local session_suffix="$1"
+  printf '127.0.0.1 session-%s.i.azure.anyscaleuserdata.com vscode-session-%s.i.azure.anyscaleuserdata.com serve-session-%s.i.azure.anyscaleuserdata.com\n' \
+    "${session_suffix}" \
+    "${session_suffix}" \
+    "${session_suffix}"
+}
+
+print_workspace_browser_tunnel_details() {
+  local host="$1"
+  local http_port="$2"
+  local https_port="$3"
+  local session_suffix
+
+  session_suffix="$(workspace_browser_session_suffix "${host}")"
+
+  printf 'session_host=%s\n' "${host}"
+  printf 'http_port=%s\n' "${http_port}"
+  printf 'https_port=%s\n' "${https_port}"
+  printf 'hosts_entry=%s\n' "$(workspace_browser_hosts_entry "${session_suffix}")"
+  printf 'browser_url=https://%s:%s/\n' "${host}" "${https_port}"
+  printf 'http_probe=curl -I -H "Host: %s" http://127.0.0.1:%s/\n' "${host}" "${http_port}"
+  printf 'https_probe=curl -k -I --resolve "%s:%s:127.0.0.1" "https://%s:%s/"\n' "${host}" "${https_port}" "${host}" "${https_port}"
+}
+
+print_workspace_head_forward_details() {
+  local session_id="$1"
+  local dashboard_port="$2"
+  local http_port="$3"
+
+  printf 'session_id=%s\n' "${session_id}"
+  printf 'dashboard_port=%s\n' "${dashboard_port}"
+  printf 'session_http_port=%s\n' "${http_port}"
+  printf 'dashboard_url=http://127.0.0.1:%s/\n' "${dashboard_port}"
+  printf 'session_http_url=http://127.0.0.1:%s/\n' "${http_port}"
+  printf 'dashboard_probe=curl -I http://127.0.0.1:%s/\n' "${dashboard_port}"
+  printf 'session_http_probe=curl -I http://127.0.0.1:%s/\n' "${http_port}"
+}
+
+path_as_file_uri() {
+  local target_path="$1"
+
+  python3 - "$target_path" <<'PY'
+import pathlib
+import sys
+
+print(pathlib.Path(sys.argv[1]).resolve().as_uri())
+PY
+}
+
+workspace_browser_auth_url() {
+  require_cmd python3
+
+  local session_id="$1"
+  local host="$2"
+
+  python3 - "$session_id" "$host" <<'PY'
+import base64
+import json
+import secrets
+import sys
+
+session_id = sys.argv[1]
+host = sys.argv[2]
+relay_state = base64.b64encode(
+  json.dumps(
+    {
+      "original_href": f"https://{host}/",
+      "nonce": secrets.token_hex(32),
+      "via_edge": "",
+    },
+    separators=(",", ":"),
+  ).encode()
+).decode().rstrip("=")
+
+print(
+  f"https://console.azure.anyscale.com/cluster_auth/{session_id}?relay_state={relay_state}&theme=light"
+)
+PY
+}
+
+write_workspace_browser_proxy_script() {
+  local script_path
+
+  script_path="$(workspace_browser_proxy_script_path)"
+  cat > "${script_path}" <<'PY'
+#!/usr/bin/env python3
+import argparse
+import selectors
+import socket
+import socketserver
+import sys
+import urllib.parse
+
+
+def build_allowed_hosts(session_suffix):
+    return {
+        f"session-{session_suffix}.i.azure.anyscaleuserdata.com",
+        f"vscode-session-{session_suffix}.i.azure.anyscaleuserdata.com",
+        f"serve-session-{session_suffix}.i.azure.anyscaleuserdata.com",
+    }
+
+
+class ProxyHandler(socketserver.StreamRequestHandler):
+    allowed_hosts = set()
+    local_http_port = 18081
+    local_https_port = 18443
+
+    def handle(self):
+        request_line = self.rfile.readline().decode("iso-8859-1").strip()
+        if not request_line:
+            return
+
+        parts = request_line.split()
+        if len(parts) != 3:
+            self.send_error(400, b"Bad Request")
+            return
+
+        method, target, version = parts
+        headers = self.read_headers()
+
+        try:
+            if method.upper() == "CONNECT":
+                self.handle_connect(target)
+            else:
+                self.handle_http(method, target, version, headers)
+        except Exception:
+            self.send_error(502, b"Bad Gateway")
+
+    def read_headers(self):
+        headers = []
+        while True:
+            line = self.rfile.readline()
+            if line in (b"\r\n", b"\n", b""):
+                break
+            headers.append(line)
+        return headers
+
+    def resolve_target(self, host, port):
+        if host not in self.allowed_hosts:
+            return None
+        if port in (80, self.local_http_port):
+            return ("127.0.0.1", self.local_http_port)
+        if port in (443, self.local_https_port):
+            return ("127.0.0.1", self.local_https_port)
+        return None
+
+    def handle_connect(self, target):
+        if ":" not in target:
+            self.send_error(400, b"CONNECT target missing port")
+            return
+
+        host, port_str = target.rsplit(":", 1)
+        upstream_target = self.resolve_target(host, int(port_str))
+        if upstream_target is None:
+            self.send_error(403, b"Forbidden")
+            return
+
+        upstream = socket.create_connection(upstream_target, timeout=10)
+        self.connection.sendall(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+        self.tunnel(self.connection, upstream)
+
+    def handle_http(self, method, target, version, headers):
+        parsed = urllib.parse.urlsplit(target)
+        host = parsed.hostname
+        port = parsed.port or 80
+        upstream_target = self.resolve_target(host, port)
+        if upstream_target is None:
+            self.send_error(403, b"Forbidden")
+            return
+
+        path = urllib.parse.urlunsplit(("", "", parsed.path or "/", parsed.query, parsed.fragment))
+        request_head = f"{method} {path} {version}\r\n".encode("iso-8859-1")
+        upstream = socket.create_connection(upstream_target, timeout=10)
+        upstream.sendall(request_head)
+        for header in headers:
+            upstream.sendall(header)
+        upstream.sendall(b"\r\n")
+        self.tunnel(self.connection, upstream)
+
+    def tunnel(self, client, upstream):
+        selector = selectors.DefaultSelector()
+        selector.register(client, selectors.EVENT_READ, upstream)
+        selector.register(upstream, selectors.EVENT_READ, client)
+        sockets = [client, upstream]
+        try:
+            while True:
+                events = selector.select(timeout=30)
+                if not events:
+                    break
+                for key, _ in events:
+                    source = key.fileobj
+                    dest = key.data
+                    data = source.recv(65536)
+                    if not data:
+                        return
+                    dest.sendall(data)
+        finally:
+            for sock in sockets:
+                try:
+                    sock.close()
+                except OSError:
+                    pass
+
+    def send_error(self, code, message):
+        response = (
+            f"HTTP/1.1 {code} Error\r\n"
+            f"Content-Length: {len(message)}\r\n"
+            "Connection: close\r\n\r\n"
+        ).encode("iso-8859-1") + message
+        self.connection.sendall(response)
+
+
+class ThreadingTCPServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
+    allow_reuse_address = True
+    daemon_threads = True
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--listen-port", type=int, required=True)
+    parser.add_argument("--session-suffix", required=True)
+    parser.add_argument("--local-http-port", type=int, required=True)
+    parser.add_argument("--local-https-port", type=int, required=True)
+    args = parser.parse_args()
+
+    ProxyHandler.allowed_hosts = build_allowed_hosts(args.session_suffix)
+    ProxyHandler.local_http_port = args.local_http_port
+    ProxyHandler.local_https_port = args.local_https_port
+
+    with ThreadingTCPServer(("127.0.0.1", args.listen_port), ProxyHandler) as server:
+        server.serve_forever()
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        sys.exit(0)
+PY
+  chmod +x "${script_path}"
+}
+
+write_workspace_browser_proxy_pac() {
+  local session_suffix="$1"
+  local proxy_port="$2"
+  local pac_path
+
+  pac_path="$(workspace_browser_proxy_pacfile)"
+  cat > "${pac_path}" <<EOF
+function FindProxyForURL(url, host) {
+  if (host == "session-${session_suffix}.i.azure.anyscaleuserdata.com" ||
+      host == "vscode-session-${session_suffix}.i.azure.anyscaleuserdata.com" ||
+      host == "serve-session-${session_suffix}.i.azure.anyscaleuserdata.com") {
+    return "PROXY 127.0.0.1:${proxy_port}";
+  }
+  return "DIRECT";
+}
+EOF
+}
+
+start_workspace_browser_proxy() {
+  require_cmd python3
+
+  local session_suffix="$1"
+  local http_port="$2"
+  local https_port="$3"
+  local proxy_port="18777"
+  local requested_proxy_port candidate_proxy_port proxy_pid logfile script_path
+
+  requested_proxy_port="${proxy_port}"
+  if listener_is_ready "${proxy_port}"; then
+    for ((candidate_proxy_port = proxy_port + 1; candidate_proxy_port <= proxy_port + 20; candidate_proxy_port++)); do
+      if ! listener_is_ready "${candidate_proxy_port}"; then
+        proxy_port="${candidate_proxy_port}"
+        warn "Local proxy port ${requested_proxy_port} is already in use; using ${proxy_port} instead."
+        break
+      fi
+    done
+  fi
+
+  write_workspace_browser_proxy_script
+  write_workspace_browser_proxy_pac "${session_suffix}" "${proxy_port}"
+
+  logfile="$(workspace_browser_proxy_logfile)"
+  script_path="$(workspace_browser_proxy_script_path)"
+  : > "${logfile}"
+
+  nohup python3 "${script_path}" \
+    --listen-port "${proxy_port}" \
+    --session-suffix "${session_suffix}" \
+    --local-http-port "${http_port}" \
+    --local-https-port "${https_port}" > "${logfile}" 2>&1 &
+  proxy_pid="$!"
+
+  if ! wait_for_local_listener "${proxy_port}" 30; then
+    kill "${proxy_pid}" 2>/dev/null || true
+    tail -20 "${logfile}" >&2 || true
+    die "Workspace browser proxy did not open on port ${proxy_port}."
+  fi
+
+  printf '%s\n' "${proxy_pid}" > "$(workspace_browser_proxy_pidfile)"
+  printf '%s\n' "${proxy_port}" > "$(workspace_browser_proxy_portfile)"
+  printf 'proxy_port=%s\n' "${proxy_port}"
+  printf 'proxy_pac=%s\n' "$(workspace_browser_proxy_pacfile)"
+}
+
+detect_workspace_browser_binary() {
+  local requested_browser="${1:-firefox}"
+  local app_path binary_path
+
+  case "${requested_browser}" in
+    firefox)
+      for app_path in \
+        "/Volumes/External SSD/Apps/Firefox.app" \
+        "/Applications/Firefox.app" \
+        "/Applications/Firefox Developer Edition.app" \
+        "/Applications/Firefox Nightly.app" \
+        "/Applications/LibreWolf.app"; do
+        [[ -d "${app_path}" ]] || continue
+        if [[ "${app_path}" == *"LibreWolf.app" ]]; then
+          binary_path="${app_path}/Contents/MacOS/librewolf"
+        else
+          binary_path="${app_path}/Contents/MacOS/firefox"
+        fi
+        if [[ -x "${binary_path}" ]]; then
+          printf '%s\n' "${binary_path}"
+          return 0
+        fi
+      done
+      ;;
+    *)
+      die "Unknown browser '${requested_browser}'. Use firefox."
+      ;;
+  esac
+
+  die "Firefox was not found. Expected it under /Volumes/External SSD/Apps/Firefox.app or a standard /Applications Firefox install."
+}
+
+write_workspace_browser_user_prefs() {
+  local pac_uri="$1"
+  local profile_dir
+
+  profile_dir="$(workspace_browser_profile_dir)"
+  cat > "${profile_dir}/user.js" <<EOF
+user_pref("app.normandy.first_run", false);
+user_pref("browser.shell.checkDefaultBrowser", false);
+user_pref("browser.tabs.warnOnClose", false);
+user_pref("browser.aboutConfig.showWarning", false);
+user_pref("browser.startup.homepage", "about:blank");
+user_pref("browser.startup.page", 0);
+user_pref("datareporting.policy.dataSubmissionEnabled", false);
+user_pref("network.captive-portal-service.enabled", false);
+user_pref("network.proxy.type", 2);
+user_pref("network.proxy.autoconfig_url", "${pac_uri}");
+user_pref("network.proxy.autoconfig_retry_interval_min", 1);
+user_pref("network.proxy.no_proxies_on", "");
+EOF
+}
+
+print_workspace_browser_app_details() {
+  local browser_binary="$1"
+  local browser_url="$2"
+  local host="$3"
+  local proxy_port="${4:-}"
+  local pac_file="${5:-}"
+
+  printf 'browser_binary=%s\n' "${browser_binary}"
+  printf 'browser_profile=%s\n' "$(workspace_browser_profile_dir)"
+  printf 'browser_url=%s\n' "${browser_url}"
+  printf 'session_host=%s\n' "${host}"
+  [[ -n "${proxy_port}" ]] && printf 'browser_proxy_port=%s\n' "${proxy_port}"
+  [[ -n "${pac_file}" ]] && printf 'browser_proxy_pac=%s\n' "${pac_file}"
+}
+
+workspace_browser_tunnel() {
+  require_cmd curl
+  require_cmd kubectl
+  require_cmd lsof
+
+  local action="start"
+  shift || true
+
+  local pidfile http_portfile https_portfile hostfile logfile pid http_port https_port host session_value
+  local ingress_name listener_pid launcher_pid http_status https_status tracked_http_port tracked_https_port tracked_host
+  pidfile="$(workspace_browser_tunnel_pidfile)"
+  http_portfile="$(workspace_browser_tunnel_http_portfile)"
+  https_portfile="$(workspace_browser_tunnel_https_portfile)"
+  hostfile="$(workspace_browser_tunnel_hostfile)"
+  logfile="$(workspace_browser_tunnel_logfile)"
+  http_port="18081"
+  https_port="18443"
+  host=""
+  session_value=""
+
+  case "${action}" in
+    start)
+      local requested_bastion_port candidate_bastion_port
+      while [[ $# -gt 0 ]]; do
+        case "$1" in
+          --session-id|--cluster-id|--session-host|--host)
+            [[ $# -ge 2 ]] || die "$1 requires a value."
+            session_value="$2"
+            shift 2
+            ;;
+          --http-port)
+            [[ $# -ge 2 ]] || die "--http-port requires a value."
+            http_port="$2"
+            shift 2
+            ;;
+          --https-port)
+            [[ $# -ge 2 ]] || die "--https-port requires a value."
+            https_port="$2"
+            shift 2
+            ;;
+          --help|-h)
+            cat <<'USAGE'
+Usage:
+  ./scripts/setup.sh workspace-browser-tunnel start --session-id ses_xxx [--http-port 18081] [--https-port 18443]
+  ./scripts/setup.sh workspace-browser-tunnel status
+  ./scripts/setup.sh workspace-browser-tunnel stop
+
+Requires kubectl access to the private AKS cluster, usually via:
+  ./scripts/setup.sh bastion-tunnel start
+  eval "$(./scripts/setup.sh kubeconfig-bastion --export)"
+
+Starts a local port-forward to ingress-nginx so a browser on this Mac can reach
+the private session hostname after adding the printed /etc/hosts entry.
+USAGE
+            return 0
+            ;;
+          *)
+            die "Unknown workspace-browser-tunnel option: $1"
+            ;;
+        esac
+      done
+
+      [[ -n "${session_value}" ]] || die "workspace-browser-tunnel start requires --session-id or --session-host."
+
+      require_cluster_kubectl_access
+
+      host="$(workspace_browser_primary_host "$(workspace_browser_session_suffix "${session_value}")")"
+      ingress_name="ses-$(workspace_browser_session_suffix "${session_value}")-head"
+
+      kubectl -n anyscale-operator get ingress "${ingress_name}" >/dev/null 2>&1 \
+        || die "Ingress ${ingress_name} was not found in namespace anyscale-operator. Confirm the session is still live before tunneling it."
+      kubectl -n ingress-nginx get service ingress-nginx-controller >/dev/null 2>&1 \
+        || die "Service ingress-nginx/ingress-nginx-controller was not found."
+
+      pid="$(pid_from_file "${pidfile}")"
+      tracked_http_port="$(cat "${http_portfile}" 2>/dev/null || true)"
+      tracked_https_port="$(cat "${https_portfile}" 2>/dev/null || true)"
+      tracked_host="$(cat "${hostfile}" 2>/dev/null || true)"
+
+      if pid_is_running "${pid}" \
+        && [[ -n "${tracked_http_port}" && -n "${tracked_https_port}" ]] \
+        && listener_is_ready "${tracked_http_port}" \
+        && listener_is_ready "${tracked_https_port}" \
+        && port_listeners_are_workspace_browser_tunnels "${tracked_http_port}" \
+        && port_listeners_are_workspace_browser_tunnels "${tracked_https_port}"; then
+        if [[ "${tracked_http_port}" != "${http_port}" || "${tracked_https_port}" != "${https_port}" ]]; then
+          log "Restarting existing workspace browser tunnel on ports ${tracked_http_port}/${tracked_https_port} to use ${http_port}/${https_port}"
+          kill "${pid}" 2>/dev/null || true
+          stop_workspace_browser_tunnel_listeners_on_port "${tracked_http_port}" || true
+          if [[ "${tracked_https_port}" != "${tracked_http_port}" ]]; then
+            stop_workspace_browser_tunnel_listeners_on_port "${tracked_https_port}" || true
+          fi
+          clear_runtime_files "${pidfile}" "${http_portfile}" "${https_portfile}" "${hostfile}"
+        else
+          printf '%s\n' "${host}" > "${hostfile}"
+          log "Workspace browser tunnel already running on 127.0.0.1:${http_port} and 127.0.0.1:${https_port}"
+          print_workspace_browser_tunnel_details "${host}" "${http_port}" "${https_port}"
+          printf 'log file: %s\n' "${logfile}"
+          return 0
+        fi
+      fi
+
+      if listener_is_ready "${http_port}"; then
+        if ! port_listeners_are_workspace_browser_tunnels "${http_port}"; then
+          die "Local HTTP port ${http_port} is already in use. Pick another with --http-port."
+        fi
+        stop_workspace_browser_tunnel_listeners_on_port "${http_port}" || true
+      fi
+      if listener_is_ready "${https_port}"; then
+        if ! port_listeners_are_workspace_browser_tunnels "${https_port}"; then
+          die "Local HTTPS port ${https_port} is already in use. Pick another with --https-port."
+        fi
+        stop_workspace_browser_tunnel_listeners_on_port "${https_port}" || true
+      fi
+      if listener_is_ready "${http_port}" || listener_is_ready "${https_port}"; then
+        die "Requested local browser-tunnel ports are still in use after cleanup. Pick different ports."
+      fi
+
+      : > "${logfile}"
+      log "Starting workspace browser tunnel for ${host} on 127.0.0.1:${http_port}/${https_port}"
+      nohup kubectl -n ingress-nginx port-forward service/ingress-nginx-controller "${http_port}:80" "${https_port}:443" > "${logfile}" 2>&1 &
+      launcher_pid="$!"
+
+      if ! wait_for_local_listener "${http_port}" 30 || ! wait_for_local_listener "${https_port}" 30; then
+        kill "${launcher_pid}" 2>/dev/null || true
+        stop_workspace_browser_tunnel_listeners_on_port "${http_port}" || true
+        stop_workspace_browser_tunnel_listeners_on_port "${https_port}" || true
+        clear_runtime_files "${pidfile}" "${http_portfile}" "${https_portfile}" "${hostfile}"
+        tail -20 "${logfile}" >&2 || true
+        die "Workspace browser tunnel did not open on ports ${http_port}/${https_port}."
+      fi
+
+      listener_pid="$(first_listener_pid "${http_port}" 2>/dev/null || true)"
+      [[ -n "${listener_pid}" ]] || die "Workspace browser tunnel opened but no listener PID was found."
+
+      printf '%s\n' "${listener_pid}" > "${pidfile}"
+      printf '%s\n' "${http_port}" > "${http_portfile}"
+      printf '%s\n' "${https_port}" > "${https_portfile}"
+      printf '%s\n' "${host}" > "${hostfile}"
+
+      http_status="$(curl -sS -o /dev/null -w '%{http_code}' -H "Host: ${host}" "http://127.0.0.1:${http_port}/" || true)"
+      https_status="$(curl -skS -o /dev/null -w '%{http_code}' --resolve "${host}:${https_port}:127.0.0.1" "https://${host}:${https_port}/" || true)"
+      if [[ "${http_status}" == "000" ]]; then
+        warn "HTTP probe to ${host} via 127.0.0.1:${http_port} failed. Check ${logfile}."
+      else
+        printf 'http_status=%s\n' "${http_status}"
+      fi
+      if [[ "${https_status}" == "000" ]]; then
+        warn "HTTPS probe to ${host} via 127.0.0.1:${https_port} failed. Check ${logfile}."
+      else
+        printf 'https_status=%s\n' "${https_status}"
+      fi
+
+      log "Workspace browser tunnel ready"
+      print_workspace_browser_tunnel_details "${host}" "${http_port}" "${https_port}"
+      printf 'log file: %s\n' "${logfile}"
+      ;;
+    status)
+      pid="$(pid_from_file "${pidfile}")"
+      http_port="$(cat "${http_portfile}" 2>/dev/null || true)"
+      https_port="$(cat "${https_portfile}" 2>/dev/null || true)"
+      host="$(cat "${hostfile}" 2>/dev/null || true)"
+
+      if [[ -n "${http_port}" && -n "${https_port}" && -n "${host}" ]] \
+        && listener_is_ready "${http_port}" \
+        && listener_is_ready "${https_port}" \
+        && port_listeners_are_workspace_browser_tunnels "${http_port}" \
+        && port_listeners_are_workspace_browser_tunnels "${https_port}"; then
+        pid="$(first_listener_pid "${http_port}" 2>/dev/null || true)"
+        [[ -n "${pid}" ]] && printf '%s\n' "${pid}" > "${pidfile}"
+        printf 'status=running\n'
+        printf 'pid=%s\n' "${pid}"
+        print_workspace_browser_tunnel_details "${host}" "${http_port}" "${https_port}"
+        printf 'log=%s\n' "${logfile}"
+        return 0
+      fi
+
+      clear_runtime_files "${pidfile}" "${http_portfile}" "${https_portfile}" "${hostfile}"
+      printf 'status=stopped\n'
+      printf 'log=%s\n' "${logfile}"
+      return 1
+      ;;
+    stop)
+      local stopped=false
+      pid="$(pid_from_file "${pidfile}")"
+      http_port="$(cat "${http_portfile}" 2>/dev/null || true)"
+      https_port="$(cat "${https_portfile}" 2>/dev/null || true)"
+
+      if pid_is_running "${pid}"; then
+        kill "${pid}" 2>/dev/null || true
+        stopped=true
+      fi
+      if [[ -n "${http_port}" ]] && stop_workspace_browser_tunnel_listeners_on_port "${http_port}"; then
+        stopped=true
+      fi
+      if [[ -n "${https_port}" && "${https_port}" != "${http_port}" ]] && stop_workspace_browser_tunnel_listeners_on_port "${https_port}"; then
+        stopped=true
+      fi
+
+      if [[ "${stopped}" == true ]]; then
+        log "Stopped workspace browser tunnel${http_port:+ on 127.0.0.1:${http_port}/${https_port}}"
+      else
+        warn "No running workspace browser tunnel found."
+      fi
+
+      clear_runtime_files "${pidfile}" "${http_portfile}" "${https_portfile}" "${hostfile}"
+      ;;
+    *)
+      die "Usage: ./scripts/setup.sh workspace-browser-tunnel {start|status|stop}"
+      ;;
+  esac
+}
+
+workspace_head_forward() {
+  require_cmd kubectl
+  require_cmd lsof
+
+  local action="start"
+  if [[ $# -gt 0 && ! "$1" =~ ^- ]]; then
+    action="$1"
+    shift || true
+  fi
+
+  local pidfile dashboard_portfile http_portfile sessionfile logfile pid dashboard_port http_port session_value session_id service_name listener_pid launcher_pid tracked_dashboard_port tracked_http_port tracked_session
+  pidfile="$(workspace_head_forward_pidfile)"
+  dashboard_portfile="$(workspace_head_forward_dashboard_portfile)"
+  http_portfile="$(workspace_head_forward_http_portfile)"
+  sessionfile="$(workspace_head_forward_sessionfile)"
+  logfile="$(workspace_head_forward_logfile)"
+  dashboard_port="18265"
+  http_port="18080"
+  session_value=""
+
+  case "${action}" in
+    start)
+      while [[ $# -gt 0 ]]; do
+        case "$1" in
+          --session-id|--cluster-id|--session-host|--host)
+            [[ $# -ge 2 ]] || die "$1 requires a value."
+            session_value="$2"
+            shift 2
+            ;;
+          --dashboard-port)
+            [[ $# -ge 2 ]] || die "--dashboard-port requires a value."
+            dashboard_port="$2"
+            shift 2
+            ;;
+          --http-port)
+            [[ $# -ge 2 ]] || die "--http-port requires a value."
+            http_port="$2"
+            shift 2
+            ;;
+          --help|-h)
+            cat <<'USAGE'
+Usage:
+  ./scripts/setup.sh workspace-head-forward --session-id ses_xxx [--dashboard-port 18265] [--http-port 18080]
+  ./scripts/setup.sh workspace-head-forward status
+  ./scripts/setup.sh workspace-head-forward stop
+
+Starts or reuses the Bastion-backed kubeconfig path and port-forwards the live
+session head service directly to localhost. This bypasses the Anyscale
+cluster_auth browser flow and exposes the Ray Dashboard on 127.0.0.1.
+USAGE
+            return 0
+            ;;
+          *)
+            die "Unknown workspace-head-forward option: $1"
+            ;;
+        esac
+      done
+
+      [[ -n "${session_value}" ]] || die "workspace-head-forward start requires --session-id or --session-host."
+
+      bastion_tunnel start --port "64435"
+      export_kubeconfig_env "$(kubeconfig_bastion --print-path)"
+      require_cluster_kubectl_access
+
+      session_id="$(workspace_browser_session_id "${session_value}")"
+      service_name="${session_id//_/-}-head"
+
+      kubectl -n anyscale-operator get service "${service_name}" >/dev/null 2>&1 \
+        || die "Service ${service_name} was not found in namespace anyscale-operator. Confirm the session is still live before forwarding it."
+
+      pid="$(pid_from_file "${pidfile}")"
+      tracked_dashboard_port="$(cat "${dashboard_portfile}" 2>/dev/null || true)"
+      tracked_http_port="$(cat "${http_portfile}" 2>/dev/null || true)"
+      tracked_session="$(cat "${sessionfile}" 2>/dev/null || true)"
+
+      if pid_is_running "${pid}" \
+        && [[ -n "${tracked_dashboard_port}" && -n "${tracked_http_port}" ]] \
+        && listener_is_ready "${tracked_dashboard_port}" \
+        && listener_is_ready "${tracked_http_port}"; then
+        if [[ "${tracked_dashboard_port}" == "${dashboard_port}" && "${tracked_http_port}" == "${http_port}" && "${tracked_session}" == "${session_id}" ]]; then
+          log "Workspace head port-forward already running on 127.0.0.1:${dashboard_port} and 127.0.0.1:${http_port}"
+          print_workspace_head_forward_details "${session_id}" "${dashboard_port}" "${http_port}"
+          printf 'log file: %s\n' "${logfile}"
+          return 0
+        fi
+
+        kill "${pid}" 2>/dev/null || true
+        [[ -n "${tracked_dashboard_port}" ]] && stop_workspace_browser_tunnel_listeners_on_port "${tracked_dashboard_port}" || true
+        if [[ -n "${tracked_http_port}" && "${tracked_http_port}" != "${tracked_dashboard_port}" ]]; then
+          stop_workspace_browser_tunnel_listeners_on_port "${tracked_http_port}" || true
+        fi
+        clear_runtime_files "${pidfile}" "${dashboard_portfile}" "${http_portfile}" "${sessionfile}"
+      fi
+
+      if listener_is_ready "${dashboard_port}"; then
+        die "Local dashboard port ${dashboard_port} is already in use. Pick another with --dashboard-port."
+      fi
+      if listener_is_ready "${http_port}"; then
+        die "Local HTTP port ${http_port} is already in use. Pick another with --http-port."
+      fi
+
+      : > "${logfile}"
+      log "Starting workspace head port-forward for ${service_name} on 127.0.0.1:${dashboard_port}/${http_port}"
+      nohup kubectl -n anyscale-operator port-forward service/"${service_name}" "${dashboard_port}:8265" "${http_port}:80" > "${logfile}" 2>&1 &
+      launcher_pid="$!"
+
+      if ! wait_for_local_listener "${dashboard_port}" 30 || ! wait_for_local_listener "${http_port}" 30; then
+        kill "${launcher_pid}" 2>/dev/null || true
+        [[ -n "${dashboard_port}" ]] && stop_workspace_browser_tunnel_listeners_on_port "${dashboard_port}" || true
+        [[ -n "${http_port}" && "${http_port}" != "${dashboard_port}" ]] && stop_workspace_browser_tunnel_listeners_on_port "${http_port}" || true
+        clear_runtime_files "${pidfile}" "${dashboard_portfile}" "${http_portfile}" "${sessionfile}"
+        tail -20 "${logfile}" >&2 || true
+        die "Workspace head port-forward did not open on ports ${dashboard_port}/${http_port}."
+      fi
+
+      listener_pid="$(first_listener_pid "${dashboard_port}" 2>/dev/null || true)"
+      [[ -n "${listener_pid}" ]] || die "Workspace head port-forward opened but no listener PID was found."
+
+      printf '%s\n' "${listener_pid}" > "${pidfile}"
+      printf '%s\n' "${dashboard_port}" > "${dashboard_portfile}"
+      printf '%s\n' "${http_port}" > "${http_portfile}"
+      printf '%s\n' "${session_id}" > "${sessionfile}"
+
+      print_workspace_head_forward_details "${session_id}" "${dashboard_port}" "${http_port}"
+      printf 'log file: %s\n' "${logfile}"
+      ;;
+    status)
+      pid="$(pid_from_file "${pidfile}")"
+      dashboard_port="$(cat "${dashboard_portfile}" 2>/dev/null || true)"
+      http_port="$(cat "${http_portfile}" 2>/dev/null || true)"
+      session_id="$(cat "${sessionfile}" 2>/dev/null || true)"
+
+      if [[ -n "${dashboard_port}" && -n "${http_port}" && -n "${session_id}" ]] \
+        && pid_is_running "${pid}" \
+        && listener_is_ready "${dashboard_port}" \
+        && listener_is_ready "${http_port}"; then
+        printf 'status=running\n'
+        printf 'pid=%s\n' "${pid}"
+        print_workspace_head_forward_details "${session_id}" "${dashboard_port}" "${http_port}"
+        printf 'log=%s\n' "${logfile}"
+        return 0
+      fi
+
+      printf 'status=stopped\n'
+      printf 'log=%s\n' "${logfile}"
+      return 1
+      ;;
+    stop)
+      local stopped=false
+      pid="$(pid_from_file "${pidfile}")"
+      dashboard_port="$(cat "${dashboard_portfile}" 2>/dev/null || true)"
+      http_port="$(cat "${http_portfile}" 2>/dev/null || true)"
+
+      if pid_is_running "${pid}"; then
+        kill "${pid}" 2>/dev/null || true
+        stopped=true
+      fi
+      if [[ -n "${dashboard_port}" ]] && stop_workspace_browser_tunnel_listeners_on_port "${dashboard_port}"; then
+        stopped=true
+        log "Stopped workspace head port-forward on 127.0.0.1:${dashboard_port}/${http_port}"
+      elif [[ -n "${http_port}" && "${http_port}" != "${dashboard_port}" ]] && stop_workspace_browser_tunnel_listeners_on_port "${http_port}"; then
+        stopped=true
+        log "Stopped workspace head port-forward on 127.0.0.1:${dashboard_port}/${http_port}"
+      fi
+      if [[ "${stopped}" != true ]]; then
+        warn "No workspace head port-forward was running."
+      fi
+      if [[ -n "${http_port}" && "${http_port}" != "${dashboard_port}" ]]; then
+        stop_workspace_browser_tunnel_listeners_on_port "${http_port}" || true
+      fi
+      clear_runtime_files "${pidfile}" "${dashboard_portfile}" "${http_portfile}" "${sessionfile}"
+      ;;
+    *)
+      die "Usage: ./scripts/setup.sh workspace-head-forward {start|status|stop}"
+      ;;
+  esac
+}
+
+workspace_head_open() {
+  local action="start"
+  if [[ $# -gt 0 && ! "$1" =~ ^- ]]; then
+    action="$1"
+    shift || true
+  fi
+
+  local session_value=""
+  local session_id=""
+  local session_suffix=""
+  local browser_name="firefox"
+  local browser_binary=""
+  local browser_url=""
+  local logfile=""
+  local launcher_pid=""
+  local profile_dir=""
+  local dashboard_port="18265"
+  local http_port="18080"
+  local ingress_http_port="18081"
+  local ingress_https_port="18443"
+  local pac_uri=""
+  local proxy_port=""
+  local proxy_pac=""
+  local keep_forward=false
+
+  case "${action}" in
+    start)
+      while [[ $# -gt 0 ]]; do
+        case "$1" in
+          --session-id|--cluster-id|--session-host|--host)
+            [[ $# -ge 2 ]] || die "$1 requires a value."
+            session_value="$2"
+            shift 2
+            ;;
+          --browser)
+            [[ $# -ge 2 ]] || die "--browser requires a value."
+            browser_name="$2"
+            shift 2
+            ;;
+          --dashboard-port)
+            [[ $# -ge 2 ]] || die "--dashboard-port requires a value."
+            dashboard_port="$2"
+            shift 2
+            ;;
+          --http-port)
+            [[ $# -ge 2 ]] || die "--http-port requires a value."
+            http_port="$2"
+            shift 2
+            ;;
+          --ingress-http-port)
+            [[ $# -ge 2 ]] || die "--ingress-http-port requires a value."
+            ingress_http_port="$2"
+            shift 2
+            ;;
+          --ingress-https-port)
+            [[ $# -ge 2 ]] || die "--ingress-https-port requires a value."
+            ingress_https_port="$2"
+            shift 2
+            ;;
+          --help|-h)
+            cat <<'USAGE'
+Usage:
+  ./scripts/setup.sh workspace-head-open --session-id ses_xxx [--browser firefox] [--dashboard-port 18265] [--http-port 18080] [--ingress-http-port 18081] [--ingress-https-port 18443]
+  ./scripts/setup.sh workspace-head-open status
+  ./scripts/setup.sh workspace-head-open stop [--keep-forward]
+
+Starts or reuses the direct head-service port-forward and the local ingress
+tunnel, configures a Firefox-only PAC proxy so embedded dashboard tiles that
+reference the private session host route through localhost, and launches a
+separate temporary Firefox profile directly to the local Ray Dashboard
+fallback.
+USAGE
+            return 0
+            ;;
+          *)
+            die "Unknown workspace-head-open option: $1"
+            ;;
+        esac
+      done
+
+      [[ -n "${session_value}" ]] || die "workspace-head-open start requires --session-id or --session-host."
+
+      workspace_head_forward start --session-id "${session_value}" --dashboard-port "${dashboard_port}" --http-port "${http_port}"
+      workspace_browser_ready start --session-id "${session_value}" --http-port "${ingress_http_port}" --https-port "${ingress_https_port}"
+
+      session_id="$(workspace_browser_session_id "${session_value}")"
+      session_suffix="$(workspace_browser_session_suffix "${session_value}")"
+      browser_url="http://127.0.0.1:${dashboard_port}/"
+      browser_binary="$(detect_workspace_browser_binary "${browser_name}")"
+      logfile="$(workspace_browser_app_logfile)"
+      profile_dir="$(workspace_browser_profile_dir)"
+
+      if workspace_browser_app_is_running; then
+        stop_workspace_browser_app_processes || true
+      fi
+      rm -rf "${profile_dir}"
+      mkdir -p "${profile_dir}"
+      : > "${logfile}"
+
+      if workspace_browser_proxy_is_running; then
+        stop_workspace_browser_proxy_processes || true
+      fi
+      start_workspace_browser_proxy "${session_suffix}" "${ingress_http_port}" "${ingress_https_port}"
+      proxy_port="$(cat "$(workspace_browser_proxy_portfile)" 2>/dev/null || true)"
+      proxy_pac="$(workspace_browser_proxy_pacfile)"
+      pac_uri="$(path_as_file_uri "${proxy_pac}")"
+      write_workspace_browser_user_prefs "${pac_uri}"
+
+      log "Launching temporary browser profile with ${browser_binary}"
+      nohup "${browser_binary}" \
+        -no-remote \
+        -new-instance \
+        -profile "${profile_dir}" \
+        "${browser_url}" > "${logfile}" 2>&1 &
+      launcher_pid="$!"
+
+      sleep 2
+      workspace_browser_app_is_running || die "The temporary browser did not stay running. Check ${logfile}."
+
+      printf '%s\n' "${launcher_pid}" > "$(workspace_browser_app_pidfile)"
+      printf '%s\n' "${browser_binary}" > "$(workspace_browser_app_browserfile)"
+      printf '%s\n' "${browser_url}" > "$(workspace_browser_app_urlfile)"
+      printf '%s\n' "ray-dashboard-${session_id}" > "$(workspace_browser_app_hostfile)"
+
+      print_workspace_head_forward_details "${session_id}" "${dashboard_port}" "${http_port}"
+      print_workspace_browser_app_details "${browser_binary}" "${browser_url}" "ray-dashboard-${session_id}" "${proxy_port}" "${proxy_pac}"
+      printf 'browser_log=%s\n' "${logfile}"
+      ;;
+    status)
+      workspace_head_forward status || true
+      if workspace_browser_app_is_running; then
+        browser_binary="$(cat "$(workspace_browser_app_browserfile)" 2>/dev/null || true)"
+        browser_url="$(cat "$(workspace_browser_app_urlfile)" 2>/dev/null || true)"
+        session_value="$(cat "$(workspace_browser_app_hostfile)" 2>/dev/null || true)"
+        printf 'browser_status=running\n'
+        print_workspace_browser_app_details "${browser_binary}" "${browser_url}" "${session_value}"
+        printf 'browser_log=%s\n' "$(workspace_browser_app_logfile)"
+        return 0
+      fi
+
+      printf 'browser_status=stopped\n'
+      printf 'browser_log=%s\n' "$(workspace_browser_app_logfile)"
+      return 1
+      ;;
+    stop)
+      while [[ $# -gt 0 ]]; do
+        case "$1" in
+          --keep-forward)
+            keep_forward=true
+            shift
+            ;;
+          --help|-h)
+            cat <<'USAGE'
+Usage:
+  ./scripts/setup.sh workspace-head-open stop [--keep-forward]
+
+Stops the temporary browser profile and, by default, also stops the backing
+head-service forward. Use --keep-forward if you only want to close the browser.
+USAGE
+            return 0
+            ;;
+          *)
+            die "Unknown workspace-head-open stop option: $1"
+            ;;
+        esac
+      done
+
+      if stop_workspace_browser_app_processes; then
+        log "Stopped temporary browser profile"
+      else
+        warn "No temporary browser profile was running."
+      fi
+      rm -rf "$(workspace_browser_profile_dir)"
+      clear_runtime_files \
+        "$(workspace_browser_app_pidfile)" \
+        "$(workspace_browser_app_browserfile)" \
+        "$(workspace_browser_app_urlfile)" \
+        "$(workspace_browser_app_hostfile)"
+
+      if stop_workspace_browser_proxy_processes; then
+        log "Stopped Firefox workspace proxy"
+      else
+        warn "No Firefox workspace proxy was running."
+      fi
+      clear_runtime_files \
+        "$(workspace_browser_proxy_pidfile)" \
+        "$(workspace_browser_proxy_portfile)" \
+        "$(workspace_browser_proxy_pacfile)" \
+        "$(workspace_browser_proxy_script_path)"
+
+      if [[ "${keep_forward}" != true ]]; then
+        workspace_browser_ready stop --keep-bastion || true
+        workspace_head_forward stop || true
+      fi
+      ;;
+    *)
+      die "Usage: ./scripts/setup.sh workspace-head-open {start|status|stop}"
+      ;;
+  esac
+}
+
+workspace_browser_ready() {
+  local action="start"
+  if [[ $# -gt 0 && ! "$1" =~ ^- ]]; then
+    action="$1"
+    shift || true
+  fi
+
+  local session_value=""
+  local bastion_port="64435"
+  local http_port="18081"
+  local https_port="18443"
+  local keep_bastion=false
+  local kubeconfig_path=""
+  local browser_status=0
+  local bastion_status=0
+
+  case "${action}" in
+    start)
+      while [[ $# -gt 0 ]]; do
+        case "$1" in
+          --session-id|--cluster-id|--session-host|--host)
+            [[ $# -ge 2 ]] || die "$1 requires a value."
+            session_value="$2"
+            shift 2
+            ;;
+          --bastion-port)
+            [[ $# -ge 2 ]] || die "--bastion-port requires a value."
+            bastion_port="$2"
+            shift 2
+            ;;
+          --http-port)
+            [[ $# -ge 2 ]] || die "--http-port requires a value."
+            http_port="$2"
+            shift 2
+            ;;
+          --https-port)
+            [[ $# -ge 2 ]] || die "--https-port requires a value."
+            https_port="$2"
+            shift 2
+            ;;
+          --help|-h)
+            cat <<'USAGE'
+Usage:
+  ./scripts/setup.sh workspace-browser-ready --session-id ses_xxx [--bastion-port 64435] [--http-port 18081] [--https-port 18443]
+  ./scripts/setup.sh workspace-browser-ready status
+  ./scripts/setup.sh workspace-browser-ready stop [--keep-bastion]
+
+Single-command equivalent of:
+  ./scripts/setup.sh bastion-tunnel start --port 64435
+  eval "$(./scripts/setup.sh kubeconfig-bastion --export)"
+  ./scripts/setup.sh workspace-browser-tunnel start --session-id ses_xxx
+
+The command starts or reuses the Bastion tunnel, writes a Bastion-backed
+kubeconfig, exports it for the current process, and starts the local browser
+tunnel to ingress-nginx.
+USAGE
+            return 0
+            ;;
+          *)
+            die "Unknown workspace-browser-ready option: $1"
+            ;;
+        esac
+      done
+
+      [[ -n "${session_value}" ]] || die "workspace-browser-ready start requires --session-id or --session-host."
+
+      requested_bastion_port="${bastion_port}"
+      if listener_is_ready "${bastion_port}" && ! port_listeners_are_bastion_tunnels "${bastion_port}"; then
+        for ((candidate_bastion_port = bastion_port + 1; candidate_bastion_port <= bastion_port + 20; candidate_bastion_port++)); do
+          if ! listener_is_ready "${candidate_bastion_port}"; then
+            bastion_port="${candidate_bastion_port}"
+            warn "Local port ${requested_bastion_port} is already in use; using Bastion port ${bastion_port} instead."
+            break
+          fi
+        done
+      fi
+      [[ -n "${bastion_port}" ]] || die "Could not determine a Bastion tunnel port."
+
+      bastion_tunnel start --port "${bastion_port}"
+      kubeconfig_path="$(kubeconfig_bastion --print-path)"
+      export_kubeconfig_env "${kubeconfig_path}"
+      printf 'kubeconfig=%s\n' "${kubeconfig_path}"
+      workspace_browser_tunnel start --session-id "${session_value}" --http-port "${http_port}" --https-port "${https_port}"
+      ;;
+    status)
+      bastion_tunnel status || bastion_status=$?
+      browser_status=0
+      workspace_browser_tunnel status || browser_status=$?
+      if (( bastion_status != 0 || browser_status != 0 )); then
+        return 1
+      fi
+      ;;
+    stop)
+      while [[ $# -gt 0 ]]; do
+        case "$1" in
+          --keep-bastion)
+            keep_bastion=true
+            shift
+            ;;
+          --help|-h)
+            cat <<'USAGE'
+Usage:
+  ./scripts/setup.sh workspace-browser-ready stop [--keep-bastion]
+
+Stops the local browser tunnel and, by default, also stops the reusable Bastion
+tunnel started for it. Use --keep-bastion if you still need kubectl access.
+USAGE
+            return 0
+            ;;
+          *)
+            die "Unknown workspace-browser-ready stop option: $1"
+            ;;
+        esac
+      done
+
+      workspace_browser_tunnel stop || true
+      if [[ "${keep_bastion}" != true ]]; then
+        bastion_tunnel stop || true
+      fi
+      ;;
+    *)
+      die "Usage: ./scripts/setup.sh workspace-browser-ready {start|status|stop}"
+      ;;
+  esac
+}
+
+workspace_browser_open() {
+  local action="start"
+  if [[ $# -gt 0 && ! "$1" =~ ^- ]]; then
+    action="$1"
+    shift || true
+  fi
+
+  local session_value=""
+  local session_id=""
+  local browser_name="firefox"
+  local browser_binary=""
+  local browser_url=""
+  local host=""
+  local session_suffix=""
+  local profile_dir=""
+  local logfile=""
+  local launcher_pid=""
+  local bastion_port="64435"
+  local http_port="18081"
+  local https_port="18443"
+  local keep_network=false
+  local pac_uri=""
+  local proxy_port=""
+  local proxy_pac=""
+
+  case "${action}" in
+    start)
+      while [[ $# -gt 0 ]]; do
+        case "$1" in
+          --session-id|--cluster-id|--session-host|--host)
+            [[ $# -ge 2 ]] || die "$1 requires a value."
+            session_value="$2"
+            shift 2
+            ;;
+          --browser)
+            [[ $# -ge 2 ]] || die "--browser requires a value."
+            browser_name="$2"
+            shift 2
+            ;;
+          --bastion-port)
+            [[ $# -ge 2 ]] || die "--bastion-port requires a value."
+            bastion_port="$2"
+            shift 2
+            ;;
+          --http-port)
+            [[ $# -ge 2 ]] || die "--http-port requires a value."
+            http_port="$2"
+            shift 2
+            ;;
+          --https-port)
+            [[ $# -ge 2 ]] || die "--https-port requires a value."
+            https_port="$2"
+            shift 2
+            ;;
+          --help|-h)
+            cat <<'USAGE'
+Usage:
+  ./scripts/setup.sh workspace-browser-open --session-id ses_xxx [--browser firefox] [--bastion-port 64435] [--http-port 18081] [--https-port 18443]
+  ./scripts/setup.sh workspace-browser-open status
+  ./scripts/setup.sh workspace-browser-open stop [--keep-network]
+
+Starts the Bastion-backed browser workflow and launches a separate temporary
+Firefox profile with its own PAC-configured local proxy for the private session
+hostname. This avoids permanent /etc/hosts changes on the Mac and avoids
+touching other browser instances.
+USAGE
+            return 0
+            ;;
+          *)
+            die "Unknown workspace-browser-open option: $1"
+            ;;
+        esac
+      done
+
+      [[ -n "${session_value}" ]] || die "workspace-browser-open start requires --session-id or --session-host."
+
+      workspace_browser_ready start --session-id "${session_value}" --bastion-port "${bastion_port}" --http-port "${http_port}" --https-port "${https_port}"
+
+      session_id="$(workspace_browser_session_id "${session_value}")"
+      session_suffix="$(workspace_browser_session_suffix "${session_value}")"
+      host="$(workspace_browser_primary_host "${session_suffix}")"
+      browser_url="$(workspace_browser_auth_url "${session_id}" "${host}")"
+      browser_binary="$(detect_workspace_browser_binary "${browser_name}")"
+      logfile="$(workspace_browser_app_logfile)"
+      profile_dir="$(workspace_browser_profile_dir)"
+
+      if workspace_browser_app_is_running; then
+        stop_workspace_browser_app_processes || true
+      fi
+      rm -rf "${profile_dir}"
+      mkdir -p "${profile_dir}"
+      : > "${logfile}"
+
+      if workspace_browser_proxy_is_running; then
+        stop_workspace_browser_proxy_processes || true
+      fi
+      start_workspace_browser_proxy "${session_suffix}" "${http_port}" "${https_port}"
+      proxy_port="$(cat "$(workspace_browser_proxy_portfile)" 2>/dev/null || true)"
+      proxy_pac="$(workspace_browser_proxy_pacfile)"
+      pac_uri="$(path_as_file_uri "${proxy_pac}")"
+      write_workspace_browser_user_prefs "${pac_uri}"
+
+      log "Launching temporary browser profile with ${browser_binary}"
+      nohup "${browser_binary}" \
+        -no-remote \
+        -new-instance \
+        -profile "${profile_dir}" \
+        "${browser_url}" > "${logfile}" 2>&1 &
+      launcher_pid="$!"
+
+      sleep 2
+      workspace_browser_app_is_running || die "The temporary browser did not stay running. Check ${logfile}."
+
+      printf '%s\n' "${launcher_pid}" > "$(workspace_browser_app_pidfile)"
+      printf '%s\n' "${browser_binary}" > "$(workspace_browser_app_browserfile)"
+      printf '%s\n' "${browser_url}" > "$(workspace_browser_app_urlfile)"
+      printf '%s\n' "${host}" > "$(workspace_browser_app_hostfile)"
+
+      print_workspace_browser_app_details "${browser_binary}" "${browser_url}" "${host}" "${proxy_port}" "${proxy_pac}"
+      printf 'browser_log=%s\n' "${logfile}"
+      ;;
+    status)
+      workspace_browser_ready status || true
+      if workspace_browser_app_is_running && workspace_browser_proxy_is_running; then
+        browser_binary="$(cat "$(workspace_browser_app_browserfile)" 2>/dev/null || true)"
+        browser_url="$(cat "$(workspace_browser_app_urlfile)" 2>/dev/null || true)"
+        host="$(cat "$(workspace_browser_app_hostfile)" 2>/dev/null || true)"
+        proxy_port="$(cat "$(workspace_browser_proxy_portfile)" 2>/dev/null || true)"
+        proxy_pac="$(workspace_browser_proxy_pacfile)"
+        printf 'browser_status=running\n'
+        print_workspace_browser_app_details "${browser_binary}" "${browser_url}" "${host}" "${proxy_port}" "${proxy_pac}"
+        printf 'browser_log=%s\n' "$(workspace_browser_app_logfile)"
+        return 0
+      fi
+
+      printf 'browser_status=stopped\n'
+      printf 'browser_log=%s\n' "$(workspace_browser_app_logfile)"
+      return 1
+      ;;
+    stop)
+      while [[ $# -gt 0 ]]; do
+        case "$1" in
+          --keep-network)
+            keep_network=true
+            shift
+            ;;
+          --help|-h)
+            cat <<'USAGE'
+Usage:
+  ./scripts/setup.sh workspace-browser-open stop [--keep-network]
+
+Stops the temporary browser profile and, by default, also removes the backing
+local Bastion/browser tunnel workflow. Use --keep-network if you only want to
+close the temporary browser and keep the tunnel running.
+USAGE
+            return 0
+            ;;
+          *)
+            die "Unknown workspace-browser-open stop option: $1"
+            ;;
+        esac
+      done
+
+      if stop_workspace_browser_app_processes; then
+        log "Stopped temporary browser profile"
+      else
+        warn "No temporary browser profile was running."
+      fi
+      rm -rf "$(workspace_browser_profile_dir)"
+      clear_runtime_files \
+        "$(workspace_browser_app_pidfile)" \
+        "$(workspace_browser_app_browserfile)" \
+        "$(workspace_browser_app_urlfile)" \
+        "$(workspace_browser_app_hostfile)"
+
+      if stop_workspace_browser_proxy_processes; then
+        log "Stopped Firefox workspace proxy"
+      else
+        warn "No Firefox workspace proxy was running."
+      fi
+      clear_runtime_files \
+        "$(workspace_browser_proxy_pidfile)" \
+        "$(workspace_browser_proxy_portfile)" \
+        "$(workspace_browser_proxy_pacfile)" \
+        "$(workspace_browser_proxy_script_path)"
+
+      if [[ "${keep_network}" != true ]]; then
+        workspace_browser_ready stop || true
+      fi
+      ;;
+    *)
+      die "Usage: ./scripts/setup.sh workspace-browser-open {start|status|stop}"
+      ;;
+  esac
+}
+
 anyscale_cli_bin() {
   printf '%s/.venv/bin/anyscale\n' "${ROOT_DIR}"
 }
@@ -836,35 +2416,6 @@ require_anyscale_cli() {
   local cli_bin
   cli_bin="$(anyscale_cli_bin)"
   [[ -x "${cli_bin}" ]] || die "Anyscale CLI not found at ${cli_bin}. Install it with uv and the repo-local .venv first."
-}
-
-anyscale_operator_release_json() {
-  local namespace="$1"
-  helm list -n "${namespace}" -o json
-}
-
-anyscale_operator_release_name() {
-  local release_json="$1"
-  jq -r 'map(select(.chart | startswith("anyscale-operator-")))[0].name // empty' <<<"${release_json}"
-}
-
-anyscale_operator_chart_version() {
-  local release_json="$1"
-  jq -r 'map(select(.chart | startswith("anyscale-operator-")))[0].chart // empty | sub("^anyscale-operator-"; "")' <<<"${release_json}"
-}
-
-anyscale_operator_auth_audience() {
-  local release_name="$1"
-  local namespace="$2"
-  local audience
-
-  audience="$(helm get values "${release_name}" -n "${namespace}" -o json | jq -r '.global.auth.audience // empty')"
-  if [[ -n "${audience}" ]]; then
-    printf '%s\n' "${audience}"
-    return 0
-  fi
-
-  printf '%s\n' 'api://086bc555-6989-4362-ba30-fded273e432b/.default'
 }
 
 azure_login_command() {
@@ -981,40 +2532,6 @@ apply() {
   run_with_timeout "${SETUP_TIMEOUT_TERRAFORM_APPLY_SECONDS}" terraform apply -auto-approve tfplan
   sync_anyscale_cli_env
   rm -f tfplan
-  maybe_auto_anyscale_workspace_ready
-}
-
-maybe_auto_anyscale_workspace_ready() {
-  if [[ "${SETUP_SKIP_AUTO_ANYSCALE_WORKSPACE_READY:-0}" == "1" ]]; then
-    log "Skipping automatic anyscale-workspace-ready because SETUP_SKIP_AUTO_ANYSCALE_WORKSPACE_READY=1."
-    return 0
-  fi
-
-  if [[ -z "${ANYSCALE_CLI_TOKEN:-}" ]]; then
-    warn "Skipping automatic anyscale-workspace-ready because ANYSCALE_CLI_TOKEN is unset."
-    return 0
-  fi
-
-  if ! command -v kubectl >/dev/null 2>&1 || ! command -v kubelogin >/dev/null 2>&1 || ! command -v helm >/dev/null 2>&1 || ! command -v jq >/dev/null 2>&1; then
-    warn "Skipping automatic anyscale-workspace-ready because kubectl, kubelogin, helm, or jq is unavailable."
-    return 0
-  fi
-
-  if [[ ! -x "$(anyscale_cli_bin)" ]]; then
-    warn "Skipping automatic anyscale-workspace-ready because the repo-local Anyscale CLI is not installed."
-    return 0
-  fi
-
-  use_bastion_kubeconfig_if_present
-  ensure_kubelogin_kubeconfig
-
-  if ! kubectl_readyz >/dev/null 2>&1; then
-    warn "Skipping automatic anyscale-workspace-ready because kubectl cannot reach the private AKS API. Start the Bastion tunnel, export the Bastion kubeconfig, then rerun ./scripts/setup.sh anyscale-workspace-ready."
-    return 0
-  fi
-
-  log "Auto-running anyscale-workspace-ready because Bastion-backed Kubernetes access and ANYSCALE_CLI_TOKEN are already available"
-  anyscale_workspace_ready
 }
 
 deploy_e2e_handoff_file() {
@@ -1090,12 +2607,25 @@ deploy_e2e_cleanup() {
 }
 
 ensure_deploy_e2e_bastion_access() {
-  local kubeconfig_path
+  local kubeconfig_path bastion_port requested_bastion_port candidate_bastion_port
+
+  bastion_port="${ANYSCALE_BASTION_PORT:-${DEFAULT_BASTION_TUNNEL_PORT}}"
 
   if bastion_tunnel status >/dev/null 2>&1; then
     log "Reusing existing Bastion tunnel for deploy-e2e"
   else
-    bastion_tunnel start
+    requested_bastion_port="${bastion_port}"
+    if listener_is_ready "${bastion_port}" && ! port_listeners_are_bastion_tunnels "${bastion_port}"; then
+      for ((candidate_bastion_port = bastion_port + 1; candidate_bastion_port <= bastion_port + 20; candidate_bastion_port++)); do
+        if ! listener_is_ready "${candidate_bastion_port}"; then
+          bastion_port="${candidate_bastion_port}"
+          warn "Local port ${requested_bastion_port} is already in use; using Bastion port ${bastion_port} instead."
+          break
+        fi
+      done
+    fi
+
+    bastion_tunnel start --port "${bastion_port}"
     DEPLOY_E2E_STARTED_TUNNEL=1
   fi
 
@@ -1132,8 +2662,10 @@ run_anyscale_post_config_sequence() {
   ensure_deploy_e2e_bastion_access
   log "Running Anyscale post-configuration and workspace registration"
   anyscale_workspaces_register
+  health
+
   log "You are ready to go with a workspace that has CPU and GPU configs ready."
-  log "Anyscale post-configuration finished. Next run ./scripts/setup.sh anyscale-workspaces-runtime-proof start-gpu, wait-gpu, and gpu-probe for the bounded GPU runtime proof."
+  log "CPU workspace is RUNNING; GPU workspace is registered (start it from the console or run ./scripts/setup.sh smoke-gpu)."
 }
 
 deploy_part1_handoff() {
@@ -1184,23 +2716,17 @@ deploy_e2e_phase1() {
   export TF_VAR_cluster_bootstrap='{"enabled":false}'
   export TF_VAR_anyscale_platform='{"enabled":false}'
   plan
-  SETUP_SKIP_AUTO_ANYSCALE_WORKSPACE_READY=1 apply
+  apply
   outputs
 }
 
 deploy_e2e_phase2() {
-  local skip_auto_workspace_ready="${1:-1}"
-
   log "Phase 2: connect through Bastion and finish the deployment"
   unset TF_VAR_cluster_bootstrap TF_VAR_anyscale_platform
   ensure_deploy_e2e_bastion_access
   export TF_VAR_cluster_bootstrap="{\"kubeconfig_path\":\"${KUBECONFIG}\"}"
   plan
-  if [[ "${skip_auto_workspace_ready}" == "1" ]]; then
-    SETUP_SKIP_AUTO_ANYSCALE_WORKSPACE_READY=1 apply
-  else
-    apply
-  fi
+  apply
   outputs
 }
 
@@ -1353,7 +2879,7 @@ USAGE
   fi
 
   deploy_e2e_phase2 1
-  deploy_part1_handoff "./scripts/setup.sh deploy-part2"
+  run_anyscale_post_config_sequence "./scripts/setup.sh deploy"
 }
 
 deploy_part2() {
@@ -1459,9 +2985,138 @@ status() {
 
     log "Ingress service"
     kubectl get service -n ingress-nginx ingress-nginx-controller -o wide || true
+
+    if [[ -n "${ANYSCALE_CLI_TOKEN:-}" ]]; then
+      log "Run ./scripts/setup.sh health for Azure, operator, workspace, and recent log checks."
+    fi
   else
     log "kubectl cannot reach the private API server from this shell. Start the Bastion shell with ./scripts/setup.sh bastion, run ./scripts/setup.sh kubeconfig inside it, then rerun status."
   fi
+}
+
+health() {
+  local cpu_workspace_name="aks-cpu-workspace"
+  local gpu_workspace_name="aks-gpu-workspace"
+  local resource_group cluster namespace extension_name cloud_resource_id cli_bin
+  local aks_provisioning_state aks_power_state extension_state cloud_state
+  local cpu_status_raw cpu_status gpu_status_raw gpu_status
+  local cpu_head_pod operator_log_matches workspace_log_matches
+
+  load_env
+  sync_anyscale_cli_env
+  require_cmd az
+  require_cmd jq
+  require_anyscale_cli
+  ensure_deploy_e2e_bastion_access
+  require_env_var ANYSCALE_CLI_TOKEN
+  require_env_var ANYSCALE_CLOUD_NAME
+
+  resource_group="$(terraform_output_raw resource_group_name)"
+  cluster="$(terraform_output_raw aks_cluster_name)"
+  extension_name="$(terraform_output_raw anyscale_extension_name)"
+  cloud_resource_id="$(terraform_output_raw anyscale_cloud_resource_id)"
+  namespace="${TF_VAR_anyscale_operator_namespace}"
+  cli_bin="$(anyscale_cli_bin)"
+
+  [[ -n "${resource_group}" && -n "${cluster}" ]] || die "Terraform outputs are missing. Run ./scripts/setup.sh apply first."
+  [[ -n "${extension_name}" ]] || die "Missing anyscale_extension_name Terraform output."
+  [[ -n "${cloud_resource_id}" ]] || die "Missing anyscale_cloud_resource_id Terraform output."
+
+  aks_provisioning_state="$(run_with_timeout "${SETUP_TIMEOUT_AZURE_COMMAND_SECONDS}" az aks show \
+    --resource-group "${resource_group}" \
+    --name "${cluster}" \
+    --query 'provisioningState' \
+    --output tsv \
+    --only-show-errors)"
+  aks_power_state="$(run_with_timeout "${SETUP_TIMEOUT_AZURE_COMMAND_SECONDS}" az aks show \
+    --resource-group "${resource_group}" \
+    --name "${cluster}" \
+    --query 'powerState.code' \
+    --output tsv \
+    --only-show-errors)"
+  [[ "${aks_provisioning_state}" == "Succeeded" ]] || die "AKS cluster ${cluster} provisioningState is ${aks_provisioning_state}, expected Succeeded."
+  [[ "${aks_power_state}" == "Running" ]] || die "AKS cluster ${cluster} power state is ${aks_power_state}, expected Running."
+  log "Azure AKS cluster ${cluster} is ${aks_provisioning_state}/${aks_power_state}."
+
+  extension_state="$(run_with_timeout "${SETUP_TIMEOUT_AZURE_COMMAND_SECONDS}" az k8s-extension show \
+    --cluster-type managedClusters \
+    --cluster-name "${cluster}" \
+    --resource-group "${resource_group}" \
+    --name "${extension_name}" \
+    --query 'provisioningState' \
+    --output tsv \
+    --only-show-errors)"
+  [[ "${extension_state}" == "Succeeded" ]] || die "Anyscale AKS extension ${extension_name} provisioningState is ${extension_state}, expected Succeeded."
+  log "Anyscale AKS extension ${extension_name} provisioningState=${extension_state}."
+
+  cloud_state="$(run_with_timeout "${SETUP_TIMEOUT_AZURE_COMMAND_SECONDS}" az resource show \
+    --ids "${cloud_resource_id}" \
+    --query 'properties.provisioningState' \
+    --output tsv \
+    --only-show-errors)"
+  [[ "${cloud_state}" == "Succeeded" ]] || die "Anyscale cloud resource provisioningState is ${cloud_state}, expected Succeeded."
+  log "Anyscale cloud resource provisioningState=${cloud_state}."
+
+  log "Checking Kubernetes rollouts"
+  kubectl rollout status deployment/anyscale-operator -n "${namespace}" --timeout=5m >/dev/null
+  kubectl rollout status deployment/ingress-nginx-controller -n ingress-nginx --timeout=5m >/dev/null
+  log "Anyscale operator and ingress-nginx deployments are Available."
+
+  cpu_status_raw="$(run_with_timeout "${SETUP_TIMEOUT_ANYSCALE_COMMAND_SECONDS}" \
+    "${cli_bin}" workspace_v2 status \
+      --name "${cpu_workspace_name}" \
+      --cloud "${ANYSCALE_CLOUD_NAME}" 2>&1)"
+  cpu_status="$(normalize_anyscale_workspace_status "${cpu_status_raw}")"
+  [[ -n "${cpu_status}" ]] || cpu_status="UNKNOWN"
+
+  if [[ "${cpu_status}" == "RUNNING" ]]; then
+    log "CPU workspace ${cpu_workspace_name} API status=${cpu_status}."
+  elif anyscale_workspace_runtime_ready_on_cluster "${cpu_workspace_name}"; then
+    warn "CPU workspace ${cpu_workspace_name} API status is ${cpu_status}, but the Ray head pod is Ready and ray status succeeds on-cluster."
+  elif [[ "${cpu_status}" =~ ^(CREATE_FAILED|FAILED|ERROR|TERMINATED|TERMINATING)$ ]]; then
+    die "CPU workspace ${cpu_workspace_name} is unhealthy with API status ${cpu_status}."
+  else
+    die "CPU workspace ${cpu_workspace_name} is not ready yet; API status=${cpu_status}."
+  fi
+
+  gpu_status_raw="$(run_with_timeout "${SETUP_TIMEOUT_ANYSCALE_COMMAND_SECONDS}" \
+    "${cli_bin}" workspace_v2 status \
+      --name "${gpu_workspace_name}" \
+      --cloud "${ANYSCALE_CLOUD_NAME}" 2>&1)"
+  gpu_status="$(normalize_anyscale_workspace_status "${gpu_status_raw}")"
+  [[ -n "${gpu_status}" ]] || gpu_status="UNKNOWN"
+
+  case "${gpu_status}" in
+    CREATE_FAILED|FAILED|ERROR)
+      die "GPU workspace ${gpu_workspace_name} is unhealthy with API status ${gpu_status}."
+      ;;
+    *)
+      log "GPU workspace ${gpu_workspace_name} API status=${gpu_status}."
+      ;;
+  esac
+
+  operator_log_matches="$(kubectl logs -n "${namespace}" deploy/anyscale-operator -c operator --since=30m 2>&1 \
+    | egrep -i 'error|warn|fail|exception|backoff|forbidden' \
+    | tail -n 20 || true)"
+  if [[ -n "${operator_log_matches}" ]]; then
+    warn "Recent Anyscale operator log matches from the last 30m:"
+    printf '%s\n' "${operator_log_matches}"
+  else
+    log "No recent Anyscale operator error/warn matches in the last 30m."
+  fi
+
+  cpu_head_pod="$(workspace_head_pod_name "${cpu_workspace_name}")"
+  workspace_log_matches="$(kubectl logs -n "${namespace}" "${cpu_head_pod}" -c ray --since=30m 2>&1 \
+    | egrep -i 'error|exception|traceback|fail|fatal' \
+    | tail -n 20 || true)"
+  if [[ -n "${workspace_log_matches}" ]]; then
+    warn "Recent CPU workspace ray log matches from the last 30m:"
+    printf '%s\n' "${workspace_log_matches}"
+  else
+    log "No recent CPU workspace ray error matches in the last 30m."
+  fi
+
+  log "Anyscale health check completed."
 }
 
 ###############################################################################
@@ -2457,134 +4112,6 @@ USAGE
 }
 
 ###############################################################################
-anyscale_workspace_ready() {
-  while [[ $# -gt 0 ]]; do
-    case "$1" in
-      --help|-h)
-        cat <<'USAGE'
-Usage:
-  ./scripts/setup.sh anyscale-workspace-ready
-
-Validates Azure-hosted Anyscale CLI access, then patches the live operator
-release with the Azure CLI token and AKS-aligned CPU/GPU instance types.
-Requires a Bastion-backed kubeconfig and ANYSCALE_CLI_TOKEN in .env.
-USAGE
-        return 0
-        ;;
-      *)
-        die "Unknown anyscale-workspace-ready option: $1"
-        ;;
-    esac
-  done
-
-  load_env
-  sync_anyscale_cli_env
-  require_anyscale_cli
-  require_cmd helm
-  require_cmd jq
-  require_cluster_kubectl_access
-  require_env_var ANYSCALE_CLI_TOKEN
-  require_env_var ANYSCALE_CLOUD_NAME
-  require_env_var ANYSCALE_CLOUD_DEPLOYMENT_ID
-
-  local cli_bin namespace release_json release_name chart_version audience
-  local operator_client_id values_file
-
-  cli_bin="$(anyscale_cli_bin)"
-  namespace="${TF_VAR_anyscale_operator_namespace}"
-
-  log "Validating Anyscale CLI access against ${ANYSCALE_HOST}"
-  run_with_timeout "${SETUP_TIMEOUT_ANYSCALE_COMMAND_SECONDS}" "${cli_bin}" cloud config get --name "${ANYSCALE_CLOUD_NAME}" >/dev/null
-
-  release_json="$(anyscale_operator_release_json "${namespace}")"
-  release_name="$(anyscale_operator_release_name "${release_json}")"
-  chart_version="$(anyscale_operator_chart_version "${release_json}")"
-  [[ -n "${release_name}" ]] || die "Could not find the installed anyscale-operator Helm release in namespace ${namespace}."
-  [[ -n "${chart_version}" ]] || die "Could not determine the installed anyscale-operator chart version."
-
-  audience="$(anyscale_operator_auth_audience "${release_name}" "${namespace}")"
-  operator_client_id="$(terraform_output_raw anyscale_operator_identity_client_id)"
-  [[ -n "${operator_client_id}" ]] || die "Terraform output anyscale_operator_identity_client_id is empty. Run ./scripts/setup.sh apply first."
-
-  mkdir -p "${CACHE_DIR}"
-  values_file="${CACHE_DIR}/anyscale-operator.workspace-ready.values.yaml"
-
-  cat > "${values_file}" <<EOF
-global:
-  cloudDeploymentId: "${ANYSCALE_CLOUD_DEPLOYMENT_ID}"
-  cloudProvider: "azure"
-  auth:
-    anyscaleCliToken: "${ANYSCALE_CLI_TOKEN}"
-    iamIdentity: "${operator_client_id}"
-    audience: "${audience}"
-workloads:
-  serviceAccount:
-    name: ${TF_VAR_anyscale_operator_serviceaccount}
-  accelerator:
-    tolerations:
-      default:
-      - key: "node.anyscale.com/accelerator-type"
-        value: "GPU"
-        effect: "NoSchedule"
-      - key: "nvidia.com/gpu"
-        operator: "Exists"
-        effect: "NoSchedule"
-  instanceTypes:
-    enableDefaults: true
-    additional:
-      14CPU-56GB-CPU:
-        resources:
-          CPU: 14
-          memory: 56Gi
-        nodeSelector:
-          agentpool: cpu
-      8CPU-32GB-1xT4-AKS:
-        resources:
-          CPU: 8
-          GPU: 1
-          'accelerator_type:T4': 1
-          memory: 32Gi
-        accelerators:
-        - T4
-        nodeSelector:
-          agentpool: gput4
-        tolerations:
-        - key: "nvidia.com/gpu"
-          operator: "Exists"
-          effect: "NoSchedule"
-        - key: "node.anyscale.com/accelerator-type"
-          operator: "Exists"
-          effect: "NoSchedule"
-        - key: "node.anyscale.com/capacity-type"
-          operator: "Exists"
-          effect: "NoSchedule"
-EOF
-
-  log "Updating the Anyscale Helm repository"
-  helm repo add anyscale https://anyscale.github.io/helm-charts >/dev/null 2>&1 || true
-  run_with_timeout "${SETUP_TIMEOUT_HELM_SECONDS}" helm repo update anyscale >/dev/null
-
-  log "Patching ${release_name} with the Azure CLI token and AKS runtime settings"
-  run_with_timeout "${SETUP_TIMEOUT_HELM_SECONDS}" helm upgrade "${release_name}" anyscale/anyscale-operator \
-    --namespace "${namespace}" \
-    --version "${chart_version}" \
-    --reuse-values \
-    --wait \
-    -f "${values_file}"
-
-  kubectl get configmap instance-types -n "${namespace}" -o jsonpath='{.data.instance_types\.yaml}' | grep -q '8CPU-32GB'
-  kubectl get configmap instance-types -n "${namespace}" -o jsonpath='{.data.instance_types\.yaml}' | grep -q '8CPU-32GB-1xT4'
-  validate_anyscale_operator_patches
-
-  if kubectl logs -n "${namespace}" deployment/anyscale-operator -c operator --tail=120 2>/dev/null | grep -q 'authentication handshake failed'; then
-    warn "The operator log tail still shows authentication handshake failures. Re-check ANYSCALE_CLI_TOKEN and control-plane reachability to ${ANYSCALE_HOST}."
-  else
-    log "Recent operator logs no longer show authentication handshake failures."
-  fi
-
-  log "Workspace-ready operator patch applied. Values file: ${values_file}"
-}
-
 write_anyscale_compute_config_file() {
   local file_path="$1"
   local profile="${2:-mixed}"
@@ -2594,40 +4121,102 @@ write_anyscale_compute_config_file() {
       cat > "${file_path}" <<EOF
 cloud: ${ANYSCALE_CLOUD_NAME}
 head_node:
-  instance_type: 8CPU-32GB
+  required_resources:
+    CPU: 8
+    memory: 32Gi
+  advanced_instance_config:
+    spec:
+      nodeSelector:
+        agentpool: cpu
 worker_nodes:
   - name: cpu-workers
-    instance_type: 8CPU-32GB
+    required_resources:
+      CPU: 8
+      memory: 32Gi
     min_nodes: 0
     max_nodes: 4
+    advanced_instance_config:
+      spec:
+        nodeSelector:
+          agentpool: cpu
   - name: gpu-workers
-    instance_type: 8CPU-32GB-1xT4
+    required_resources:
+      CPU: 8
+      GPU: 1
+      memory: 32Gi
+    required_labels:
+      ray.io/accelerator-type: T4
     min_nodes: 0
     max_nodes: 2
+    advanced_instance_config:
+      spec:
+        nodeSelector:
+          agentpool: gput4
+        tolerations:
+          - key: nvidia.com/gpu
+            operator: Exists
+            effect: NoSchedule
+          - key: node.anyscale.com/accelerator-type
+            operator: Exists
+            effect: NoSchedule
 EOF
       ;;
     cpu)
       cat > "${file_path}" <<EOF
 cloud: ${ANYSCALE_CLOUD_NAME}
 head_node:
-  instance_type: 8CPU-32GB
+  required_resources:
+    CPU: 8
+    memory: 32Gi
+  advanced_instance_config:
+    spec:
+      nodeSelector:
+        agentpool: cpu
 worker_nodes:
   - name: cpu-workers
-    instance_type: 8CPU-32GB
+    required_resources:
+      CPU: 8
+      memory: 32Gi
     min_nodes: 0
     max_nodes: 1
+    advanced_instance_config:
+      spec:
+        nodeSelector:
+          agentpool: cpu
 EOF
       ;;
     gpu)
       cat > "${file_path}" <<EOF
 cloud: ${ANYSCALE_CLOUD_NAME}
 head_node:
-  instance_type: 8CPU-32GB-1xT4
+  required_resources:
+    CPU: 8
+    memory: 32Gi
+  advanced_instance_config:
+    spec:
+      nodeSelector:
+        agentpool: cpu
 worker_nodes:
   - name: gpu-workers
-    instance_type: 8CPU-32GB-1xT4
+    required_resources:
+      CPU: 8
+      GPU: 1
+      memory: 32Gi
+    required_labels:
+      ray.io/accelerator-type: T4
     min_nodes: 0
     max_nodes: 1
+    advanced_instance_config:
+      spec:
+        nodeSelector:
+          agentpool: gput4
+        tolerations:
+          - key: nvidia.com/gpu
+            operator: Exists
+            effect: NoSchedule
+          - key: node.anyscale.com/accelerator-type
+            operator: Exists
+            effect: NoSchedule
 EOF
       ;;
     *)
@@ -2641,36 +4230,21 @@ ensure_anyscale_compute_config() {
   local cli_bin="$2"
   local config_file="$3"
   local profile="${4:-mixed}"
-  local get_output expected_type
+  local get_output
 
   write_anyscale_compute_config_file "${config_file}" "${profile}"
-
-  case "${profile}" in
-    cpu)
-      expected_type="8CPU-32GB"
-      ;;
-    gpu)
-      expected_type="8CPU-32GB-1xT4"
-      ;;
-    mixed)
-      expected_type="8CPU-32GB-1xT4"
-      ;;
-    *)
-      die "Unknown Anyscale compute config profile ${profile}"
-      ;;
-  esac
 
   if get_output="$(run_with_timeout "${SETUP_TIMEOUT_ANYSCALE_COMMAND_SECONDS}" \
     "${cli_bin}" compute-config get \
       --name "${compute_config_name}" \
       --cloud-name "${ANYSCALE_CLOUD_NAME}" 2>&1)"; then
-    if grep -q "instance_type: ${expected_type}" <<<"${get_output}" && ! grep -Eq '14CPU-56GB-CPU|8CPU-32GB-1xT4-AKS' <<<"${get_output}"; then
-      log "Using existing Anyscale compute config ${compute_config_name}"
+    if grep -q 'required_resources' <<<"${get_output}" && ! grep -Eq 'instance_type:|14CPU-56GB-CPU|8CPU-32GB-1xT4-AKS' <<<"${get_output}"; then
+      log "Using existing Anyscale declarative compute config ${compute_config_name}"
       return 0
     fi
-    log "Refreshing Anyscale compute config ${compute_config_name} to use built-in operator instance type ${expected_type}"
+    log "Refreshing Anyscale compute config ${compute_config_name} to declarative profile ${profile}"
   else
-    log "Creating Anyscale compute config ${compute_config_name}"
+    log "Creating Anyscale declarative compute config ${compute_config_name} (profile ${profile})"
   fi
 
   run_with_timeout "${SETUP_TIMEOUT_ANYSCALE_COMMAND_SECONDS}" \
@@ -3196,7 +4770,6 @@ USAGE
     fi
   }
 
-  anyscale_workspace_ready
   validate_anyscale_operator_patches
   ensure_anyscale_compute_config "${cpu_compute_config_name}" "${cli_bin}" "${cpu_compute_config_file}" "cpu"
   ensure_anyscale_compute_config "${gpu_compute_config_name}" "${cli_bin}" "${gpu_compute_config_file}" "gpu"
@@ -3388,11 +4961,27 @@ USAGE
     {
       printf 'workspace=%s\n' "${gpu_workspace_name}"
       printf 'head_pod=%s\n' "${gpu_head_pod}"
-      printf 'node=%s\n' "${gpu_node_name}"
+      printf 'head_node=%s\n' "${gpu_node_name}"
       kubectl get pod -n "${namespace}" "${gpu_head_pod}" -o wide
     } 2>&1 | tee "${gpu_node_log}"
 
-    [[ "${gpu_node_name}" == "${gpu_node_prefix}"* ]] || die "GPU workspace ${gpu_workspace_name} head pod is running on unexpected node ${gpu_node_name}. See ${gpu_node_log}."
+    log "GPU workspace ${gpu_workspace_name} head pod runs on ${gpu_node_name} (head pod placement is informational; GPU is required only for workers spawned via num_gpus=1)."
+  }
+
+  assert_gpu_worker_scheduled() {
+    local gpu_worker_count
+
+    gpu_worker_count="$(kubectl get pods -n "${namespace}" -o wide --no-headers 2>/dev/null \
+      | awk -v prefix="${gpu_node_prefix}" '$7 ~ "^"prefix {count++} END {print count+0}')"
+
+    {
+      printf 'gpu_node_prefix=%s\n' "${gpu_node_prefix}"
+      printf 'gpu_worker_pod_count=%s\n' "${gpu_worker_count}"
+      kubectl get pods -n "${namespace}" -o wide --no-headers 2>/dev/null \
+        | awk -v prefix="${gpu_node_prefix}" '$7 ~ "^"prefix {print}'
+    } 2>&1 | tee -a "${gpu_node_log}"
+
+    [[ "${gpu_worker_count}" -ge 1 ]] || die "Ray num_gpus=1 task did not schedule any pod on a ${gpu_node_prefix}* node. See ${gpu_node_log}."
   }
 
   run_gpu_probe() {
@@ -3400,39 +4989,52 @@ USAGE
 
     assert_gpu_head_node
 
-
-    if ! workspace_exec_head_bash_with_timeout "${gpu_workspace_name}" 'nvidia-smi -L' "${command_timeout_seconds}" 2>&1 | tee "${gpu_nvidia_log}"; then
-      die "nvidia-smi failed for ${gpu_workspace_name}. See ${gpu_nvidia_log}."
-    fi
-    grep -Eiq 'GPU [0-9]+:|Tesla T4|NVIDIA' "${gpu_nvidia_log}" || die "nvidia-smi did not report a visible GPU. See ${gpu_nvidia_log}."
-
     gpu_ray_command="$(cat <<'EOF'
 python - <<'PY'
 import os
+import socket
 import ray
 
 ray.init(address="auto")
 
 @ray.remote(num_gpus=1)
 def gpu_probe():
-    return os.environ.get("CUDA_VISIBLE_DEVICES", "none")
+    return {
+        "cuda": os.environ.get("CUDA_VISIBLE_DEVICES", "none"),
+        "host": socket.gethostname(),
+    }
 
 result = ray.get(gpu_probe.remote())
-print(f"CUDA_VISIBLE_DEVICES={result}")
-if result in ("", "none"):
+print(f"CUDA_VISIBLE_DEVICES={result['cuda']}")
+print(f"GPU_WORKER_HOSTNAME={result['host']}")
+if result["cuda"] in ("", "none"):
     raise SystemExit("GPU_PROBE_FAILED")
 print("GPU_WORKSPACE_OK")
 PY
 EOF
 )"
 
-    if ! workspace_exec_head_bash_with_timeout "${gpu_workspace_name}" "${gpu_ray_command}" "${command_timeout_seconds}" 2>&1 | tee "${gpu_ray_log}"; then
-      die "Ray GPU probe failed for ${gpu_workspace_name}. See ${gpu_ray_log}."
-    fi
-    grep -q 'GPU_WORKSPACE_OK' "${gpu_ray_log}" || die "Ray GPU probe did not emit GPU_WORKSPACE_OK. See ${gpu_ray_log}."
+    local probe_attempt probe_max_attempts probe_exit
+    probe_max_attempts=4
+    for ((probe_attempt=1; probe_attempt<=probe_max_attempts; probe_attempt++)); do
+      log "Ray num_gpus=1 probe attempt ${probe_attempt}/${probe_max_attempts} on ${gpu_workspace_name}"
+      probe_exit=0
+      workspace_exec_head_bash_with_timeout "${gpu_workspace_name}" "${gpu_ray_command}" "${command_timeout_seconds}" 2>&1 | tee "${gpu_ray_log}" || probe_exit=$?
+      if [[ "${probe_exit}" -eq 0 ]] && grep -q 'GPU_WORKSPACE_OK' "${gpu_ray_log}"; then
+        break
+      fi
+      if [[ "${probe_attempt}" -eq "${probe_max_attempts}" ]]; then
+        die "Ray GPU probe failed after ${probe_max_attempts} attempts for ${gpu_workspace_name}. Last exit=${probe_exit}. See ${gpu_ray_log}."
+      fi
+      log "Probe attempt ${probe_attempt} failed (exit=${probe_exit}); waiting 30s for workspace head pod to settle and retrying"
+      sleep 30
+      wait_for_anyscale_workspace_running_attempts "${gpu_workspace_name}" "${cli_bin}" "${gpu_wait_log}" 10 30 || true
+    done
 
-    log "GPU workspace ${gpu_workspace_name} passed nvidia-smi and Ray num_gpus=1 probes."
-    log "Logs: ${gpu_node_log}, ${gpu_nvidia_log}, ${gpu_ray_log}"
+    assert_gpu_worker_scheduled
+
+    log "GPU workspace ${gpu_workspace_name} passed the Ray num_gpus=1 probe and a worker pod was scheduled on a ${gpu_node_prefix}* node."
+    log "Logs: ${gpu_node_log}, ${gpu_ray_log}"
   }
 
   run_cpu_probe() {
@@ -3491,10 +5093,10 @@ post() {
   log "Kubernetes bootstrap is Terraform-managed. Re-run terraform apply to reconcile the operator service account, NVIDIA device plugin, and ingress-nginx releases."
   log "For the simplest guided flow, run ./scripts/setup.sh deploy-part1 --from-scratch --yes, update ONLY ANYSCALE_CLI_TOKEN in .env if needed, then run ./scripts/setup.sh deploy-part2."
   log "For the guided two-phase flow with an ANYSCALE_CLI_TOKEN pause/resume handoff, run ./scripts/setup.sh deploy-e2e --from-scratch --yes and later resume with ./scripts/setup.sh deploy-e2e --resume."
-  log "If the current shell already has a Bastion-backed kubeconfig and ANYSCALE_CLI_TOKEN, ./scripts/setup.sh apply now auto-runs ./scripts/setup.sh anyscale-workspace-ready after Terraform finishes."
-  log "Otherwise, rerun ./scripts/setup.sh anyscale-workspace-ready to inject the Azure CLI token and AKS-aligned CPU/GPU instance types into the operator release."
+  log "The Anyscale operator's helm values (Azure CLI token, AKS-aligned tolerations, instance-type defaults) are now Terraform-managed via the AKS extension. Re-run ./scripts/setup.sh apply to reconcile any changes."
   log "Use ./scripts/setup.sh anyscale-workspaces-register to register the aks-cpu and aks-gpu compute configs plus the aks-cpu-workspace and aks-gpu-workspace workspaces; the CPU workspace is started and validated, the GPU workspace is registered only."
-  log "Use ./scripts/setup.sh anyscale-workspaces-runtime-proof start-gpu, wait-gpu, and gpu-probe to run the bounded GPU runtime proof before doing the manual console proof."
+  log "Use ./scripts/setup.sh health after deploys or operator changes to verify Azure resource state, operator rollouts, workspace readiness, and recent operator/workspace logs."
+  log "Use ./scripts/setup.sh smoke-gpu (or ./scripts/setup.sh anyscale-workspaces-runtime-proof start-gpu|wait-gpu|gpu-probe) to opt into the bounded GPU runtime proof. It is no longer part of the default deploy path."
   warn "For a Bastion-backed local workflow, export TF_VAR_cluster_bootstrap with the Bastion kubeconfig path before re-running terraform apply."
 }
 
@@ -3595,16 +5197,23 @@ case "${cmd}" in
   apply)      apply ;;
   deploy-part1) shift; deploy_part1 "$@" ;;
   deploy-part2) shift; deploy_part2 "$@" ;;
+  deploy)     shift; deploy_part1 "$@" ;;
   deploy-e2e) shift; deploy_e2e "$@" ;;
   outputs)    outputs ;;
   bastion)    shift; bastion "$@" ;;
   bastion-tunnel) shift; bastion_tunnel "$@" ;;
   kubeconfig) kubeconfig ;;
   kubeconfig-bastion) shift; kubeconfig_bastion "$@" ;;
-  anyscale-workspace-ready) shift; anyscale_workspace_ready "$@" ;;
-  anyscale-workspace-create) shift; anyscale_workspace_create "$@" ;;
+  workspace-head-forward) shift; workspace_head_forward "$@" ;;
+  workspace-head-open) shift; workspace_head_open "$@" ;;
+  workspace-browser-ready) shift; workspace_browser_ready "$@" ;;
+  workspace-browser-open) shift; workspace_browser_open "$@" ;;
+  workspace-browser-tunnel) shift; workspace_browser_tunnel "$@" ;;
+  anyscale_workspace_create) shift; anyscale_workspace_create "$@" ;;
   anyscale-workspaces-register) shift; anyscale_workspaces_register "$@" ;;
   anyscale-workspaces-runtime-proof) shift; anyscale_workspaces_runtime_proof "$@" ;;
+  smoke-gpu) shift; anyscale_workspaces_runtime_proof all "$@" ;;
+  health)     health ;;
   post)       post ;;
   control-plane-egress-smoke) control_plane_egress_smoke ;;
   validate-focused) shift; validate_focused "$@" ;;
@@ -3615,5 +5224,5 @@ case "${cmd}" in
   destroy)    destroy ;;
   nuke)       shift; nuke "$@" ;;
   all)        preflight; tf_init; validate; plan; apply; outputs ;;
-  *) die "Usage: $0 {preflight|tfvars|init|validate|plan|apply|deploy-part1|deploy-part2|deploy-e2e|outputs|bastion|bastion-tunnel|kubeconfig|kubeconfig-bastion|anyscale-workspace-ready|anyscale-workspace-create|anyscale-workspaces-register|anyscale-workspaces-runtime-proof|post|control-plane-egress-smoke|validate-focused|validate-k8s|validate-observability|functional-test|status|destroy|nuke|all}" ;;
+  *) die "Usage: $0 {preflight|tfvars|init|validate|plan|apply|deploy-part1|deploy-part2|deploy-e2e|outputs|bastion|bastion-tunnel|kubeconfig|kubeconfig-bastion|workspace-head-forward|workspace-head-open|workspace-browser-ready|workspace-browser-open|workspace-browser-tunnel|anyscale-workspace-create|anyscale-workspaces-register|anyscale-workspaces-runtime-proof|smoke-gpu|health|post|control-plane-egress-smoke|validate-focused|validate-k8s|validate-observability|functional-test|status|destroy|nuke|all}" ;;
 esac
