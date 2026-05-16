@@ -506,6 +506,117 @@ Use `nuke` when you need a full reset after a failed private-cluster experiment 
 
 `nuke` is intentionally stronger than `destroy`. It waits for the resource group deletion to finish, removes local Terraform state and plan files, keeps `.env` and `.terraform.lock.hcl`, and leaves you ready to run `./scripts/setup.sh init` before the next plan or apply.
 
+### Retire legacy Anyscale clouds on Azure
+
+If old Anyscale clouds or workspace records remain after you have moved on to a newer deployment, use the sequence below. This is the exact cleanup path that was exercised against older `anyscaleb2-*`, `anyscaleb3-*`, and `anyscalebb-*` Azure-backed clouds during the May 2026 validation session.
+
+1. Inventory every workspace across every visible cloud and terminate the workspace records first:
+
+   ```bash
+   set -a; source .env; set +a
+   .venv/bin/anyscale workspace_v2 list -j --no-interactive --include-archived --max-items 500 \
+     | jq '[.[] | {name,id,state,cloud_id,project_id}]'
+   ```
+
+   Then terminate each non-terminated workspace by ID:
+
+   ```bash
+   .venv/bin/anyscale workspace_v2 terminate --id <workspace-id>
+   ```
+
+2. Inspect the cloud inventory and probe cloud-level cleanup hooks:
+
+   ```bash
+   .venv/bin/anyscale cloud list -j --no-interactive --max-items 100 \
+     | jq '[.[] | {id,name}]'
+
+   .venv/bin/anyscale cloud status --id <cloud-id> -o .cache/<cloud-id>.status.yaml
+   .venv/bin/anyscale cloud terminate-system-cluster --id <cloud-id> --wait
+   ```
+
+   In the validated Azure cleanup flow, the old clouds returned `No system cluster found`, which ruled out the system-cluster path as the deletion blocker.
+
+3. Try the Anyscale CLI cloud delete command, but expect the Azure limitation:
+
+   ```bash
+   .venv/bin/anyscale cloud delete --id <cloud-id> --yes
+   ```
+
+   On Azure this currently fails with:
+
+   ```text
+   Error: `cloud delete` is not supported on Azure, see https://docs.anyscale.com/azure#limitations
+   ```
+
+4. Fall back to Azure Resource Manager and delete the `Anyscale.Platform/clouds` resource directly:
+
+   ```bash
+   az resource delete --ids \
+     "/subscriptions/<sub>/resourceGroups/<rg>/providers/Anyscale.Platform/clouds/<cloud-name>"
+   ```
+
+   If ARM returns a `409` stating the cloud still has associated clusters, capture the cluster IDs from that error. That means the workspace records are not the only remaining blocker.
+
+5. Enumerate the active Anyscale clusters in every project:
+
+   ```bash
+   set -a; source .env; set +a
+   .venv/bin/anyscale cluster list --include-all-projects --include-inactive --include-archived --max-items 200
+   ```
+
+   The currently shipped CLI exposes `cluster archive`, but in this environment that command raised `AttributeError: 'DefaultApi' object has no attribute 'archive_cluster'` and could not be used to clear the blockers.
+
+6. Use the installed controller directly from the repo virtualenv to send cluster terminate requests by cluster ID:
+
+   ```bash
+   set -a; source .env; set +a
+   .venv/bin/python - <<'PY'
+   from anyscale.controllers.cluster_controller import ClusterController
+
+   ClusterController().terminate(
+       cluster_name=None,
+       cluster_id="<cluster-id>",
+       project_id="<project-id>",
+       project_name=None,
+       cloud_id=None,
+       cloud_name=None,
+   )
+   PY
+   ```
+
+   To poll the exact cluster state without relying on the broken public archive path:
+
+   ```bash
+   set -a; source .env; set +a
+   .venv/bin/python - <<'PY'
+   from anyscale.controllers.cluster_controller import ClusterController
+
+   cc = ClusterController()
+   cluster = cc.api_client.get_decorated_cluster_api_v2_decorated_sessions_cluster_id_get("<cluster-id>").result
+   print(cluster.id)
+   print(cluster.state)
+   PY
+   ```
+
+7. If those cluster states remain `Running` or `StartingUp` even after direct terminate requests, stop retrying ad hoc commands and preserve an incident bundle for support. The local bundle captured during validation used this layout under `.cache/anyscale-cloud-cleanup-<timestamp>/`:
+
+   - `workspaces.before.json` and `workspaces.after.json`
+   - `<cloud-id>.status.before.yaml` and `<cloud-id>.status.after-terminate.yaml`
+   - `azure-cloud-resource-ids.txt`
+   - `run.log`
+
+The validated outcome on Azure was:
+
+- `workspace_v2 terminate` successfully cleared the newest default-cloud workspaces.
+- `cloud terminate-system-cluster` reported no system cluster on the legacy clouds.
+- `cloud delete` is not supported on Azure.
+- `az resource delete` reached the provider, but ARM returned `409` because active Anyscale clusters were still associated with the legacy clouds.
+- direct `ClusterController().terminate(...)` requests were accepted, but some legacy clusters still remained `Running` or `StartingUp`, which left the Azure cloud resources undeletable without backend intervention.
+
+Follow-up validation against the internal authenticated API confirmed the same boundary. `DELETE /api/v2/clouds/{cloud_id}` returned the same active-cluster `409` blockers as ARM, `DELETE /api/v2/experimental_workspaces/{workspace_id}` refused any workspace whose cluster was still `StartingUp`, and `POST /api/v2/sessions/{session_id}/stop` with `terminate=true` and `delete=true` returned `200` without changing the stuck session state. For the blocked legacy cloud `cld_dn8pd6q8dryr9sfu5n2rtbrsh3`, `GET /api/v2/clouds/{cloud_id}/resources` returned an empty resource list while workspace events kept logging `Could not start cluster: no cloud resources are currently healthy for cluster placement.`, which confirms an empty-cloud backend-state mismatch rather than a remaining repo-side cleanup step.
+
+When you hit that final state, the repo-side cleanup is exhausted and the remaining action is an Anyscale support case with the saved bundle plus the blocking cluster IDs from the ARM `409` response.
+
 ## Current validated baseline
 
 The most recent end-to-end rerun completed on `2026-05-12` against Kubernetes `1.34.6` in `westus3`. That run completed the two-phase deployment, left the AKS cluster private and healthy, applied the Terraform-managed bootstrap layer, deployed the Anyscale platform resources, patched the operator successfully, and registered the AKS-aligned `aks-cpu` and `aks-gpu` compute configs plus the `aks-cpu-workspace` and `aks-gpu-workspace` workspaces used by the manual CPU and GPU validation path.
