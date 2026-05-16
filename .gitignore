@@ -27,6 +27,8 @@ override.tf.json
 # Plan output
 *.tfplan
 tfplan
+*.tfplan.*
+tfplan.*
 *.log
 *-apply.log
 
