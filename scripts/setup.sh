@@ -3,39 +3,10 @@
 # Idempotent orchestrator for the private AKS / Anyscale sample environment.
 #
 # Usage:
-#   ./scripts/setup.sh preflight   # validate local tools, Azure auth, and .env
-#   ./scripts/setup.sh tfvars      # render terraform.auto.tfvars.json from .env
-#   ./scripts/setup.sh init        # terraform init
-#   ./scripts/setup.sh validate    # fmt + validate + terraform native tests
-#   ./scripts/setup.sh plan        # save tfplan
-#   ./scripts/setup.sh apply       # apply saved plan and auto-run Anyscale post-config when Bastion kubeconfig + token are ready
-#   ./scripts/setup.sh deploy-part1 [--from-scratch --yes] # guided phase-1 + phase-2 deploy that always stops for the manual token handoff
-#   ./scripts/setup.sh deploy-part2 # guided post-token continuation that patches the operator and registers CPU/GPU workspaces
-#   ./scripts/setup.sh deploy-e2e [--from-scratch --yes|--resume] # compatibility wrapper for the older guided pause/resume flow
-#   ./scripts/setup.sh outputs     # print terraform outputs
-#   ./scripts/setup.sh bastion     # open az aks bastion preview tunnel/shell
-#   ./scripts/setup.sh bastion-tunnel start [--port 64430] # run a reusable Bastion tunnel to the private AKS API
-#   ./scripts/setup.sh kubeconfig  # fetch Entra kubeconfig + kubelogin conversion
-#   ./scripts/setup.sh kubeconfig-bastion [--admin] [--export] # write kubeconfig pointed at the Bastion tunnel
-#   ./scripts/setup.sh workspace-head-forward --session-id ses_xxx # start a direct head-service port-forward for the Ray Dashboard
-#   ./scripts/setup.sh workspace-head-open --session-id ses_xxx # launch a temporary Firefox profile directly to the Ray Dashboard fallback
-#   ./scripts/setup.sh workspace-browser-ready --session-id ses_xxx # start or reuse Bastion + kubeconfig + local browser tunnel in one command
-#   ./scripts/setup.sh workspace-browser-open --session-id ses_xxx # launch a temporary separate Firefox profile with no host-file changes
-#   ./scripts/setup.sh workspace-browser-tunnel start --session-id ses_xxx # forward private session ingress to localhost for a browser on this Mac
-#   ./scripts/setup.sh anyscale-workspace-create --name my-workspace [--compute-config aks-cpu|aks-gpu] [--start] # create an extra workspace through the CLI path
-#   ./scripts/setup.sh anyscale-workspaces-register # register aks-cpu/aks-gpu compute configs and aks-cpu-workspace/aks-gpu-workspace; start+validate CPU only
-#   ./scripts/setup.sh anyscale-workspaces-runtime-proof start-gpu|wait-gpu|gpu-probe|cpu-probe|all # bounded runtime proof steps
-#   ./scripts/setup.sh smoke-gpu   # opt-in: start GPU workspace + Ray num_gpus=1 probe (alias for runtime-proof all)
-#   ./scripts/setup.sh post        # explain the Terraform-managed Kubernetes bootstrap flow
-#   ./scripts/setup.sh control-plane-egress-smoke # prove cluster egress to Anyscale control-plane endpoints
-#   ./scripts/setup.sh validate-focused [--skip-observability] # run the live validation suite with pass/fail output
-#   ./scripts/setup.sh validate-k8s # run DNS/egress/ingress/GPU validation through kubectl
-#   ./scripts/setup.sh validate-observability # query Log Analytics for ContainerLogV2 + diagnostics
-#   ./scripts/setup.sh functional-test # run validate-k8s after the Terraform-managed bootstrap is applied
-#   ./scripts/setup.sh status      # summarize live Azure + Kubernetes status
-#   ./scripts/setup.sh destroy     # terraform destroy using generated tfvars
-#   ./scripts/setup.sh nuke [--yes] # force-delete the configured RG and purge residual state files
-#   ./scripts/setup.sh all         # preflight + init + validate + plan + apply + outputs
+#   ./scripts/setup.sh deploy [--from-scratch --yes]
+#   ./scripts/setup.sh verify [--static|--live|--full] [--skip-observability]
+#   ./scripts/setup.sh workload proof {cpu|gpu|all}
+#   ./scripts/setup.sh teardown [--force] [--yes]
 ###############################################################################
 set -euo pipefail
 
@@ -79,6 +50,11 @@ FOCUSED_VALIDATION_FAIL_COUNT=0
 FOCUSED_VALIDATION_SKIP_COUNT=0
 ANYSCALE_WORKSPACE_WAIT_RESULT=""
 DEPLOY_E2E_STARTED_TUNNEL=0
+SETUP_RUN_DIR=""
+SETUP_STAGE_LOG_DIR=""
+SETUP_STAGE_INDEX=0
+SETUP_STAGE_TOTAL=0
+SETUP_STAGE_RESULTS=()
 
 escape_env_double_quoted() {
   printf '%s' "$1" | sed 's/[\\"]/\\&/g'
@@ -955,7 +931,13 @@ run_focused_validation_check() {
   display_logfile="$(focused_validation_display_path "${logfile}")"
 
   printf '\n==> %s\n' "${label}"
-  if "$@" > >(tee "${logfile}") 2>&1; then
+  local exit_code
+  set +e
+  "$@" 2>&1 | tee "${logfile}"
+  exit_code=${PIPESTATUS[0]}
+  set -e
+
+  if [[ "${exit_code}" -eq 0 ]]; then
     record_focused_validation_result "PASS" "${check_id}" "${label}" "${display_logfile}"
     printf '[PASS] %s\n' "${label}"
     return 0
@@ -1027,7 +1009,7 @@ resolve_aks_cluster_id() {
   local rg cluster
   rg="$(resolve_aks_context resource_group_name)"
   cluster="$(resolve_aks_context aks_cluster_name)"
-  [[ -n "${rg}" && -n "${cluster}" ]] || die "Terraform outputs are missing. Run ./scripts/setup.sh apply first."
+  [[ -n "${rg}" && -n "${cluster}" ]] || die "Terraform outputs are missing. Run ./scripts/setup.sh deploy first."
   run_with_timeout "${SETUP_TIMEOUT_AZURE_COMMAND_SECONDS}" az aks show --resource-group "${rg}" --name "${cluster}" --query id -o tsv --only-show-errors
 }
 
@@ -1056,7 +1038,7 @@ require_cluster_kubectl_access() {
   require_cmd kubectl
   use_bastion_kubeconfig_if_present
   ensure_kubelogin_kubeconfig
-  kubectl_readyz >/dev/null 2>&1 || die "kubectl cannot reach the cluster. Start a Bastion tunnel with ./scripts/setup.sh bastion-tunnel start and set KUBECONFIG via ./scripts/setup.sh kubeconfig-bastion --export."
+  kubectl_readyz >/dev/null 2>&1 || die "kubectl cannot reach the cluster. Re-run ./scripts/setup.sh deploy or ./scripts/setup.sh verify --live so the orchestrator can refresh Bastion access."
 }
 
 workspace_browser_session_suffix() {
@@ -2534,70 +2516,71 @@ apply() {
   rm -f tfplan
 }
 
-deploy_e2e_handoff_file() {
-  harness_state_file "deploy-e2e.pause.txt"
+setup_run_init() {
+  local run_name="$1"
+  local stage_total="$2"
+  local run_id
+
+  run_id="$(date -u +%Y%m%dT%H%M%SZ)"
+  SETUP_RUN_DIR="${HARNESS_DIR}/runs/${run_id}-${run_name}"
+  SETUP_STAGE_LOG_DIR="${SETUP_RUN_DIR}/logs"
+  SETUP_STAGE_INDEX=0
+  SETUP_STAGE_TOTAL="${stage_total}"
+  SETUP_STAGE_RESULTS=()
+
+  mkdir -p "${SETUP_STAGE_LOG_DIR}"
+  printf 'stage\tresult\tduration_seconds\tlog\n' > "${SETUP_RUN_DIR}/stages.tsv"
+  log "Run logs: ${SETUP_RUN_DIR}"
 }
 
-write_anyscale_cli_handoff() {
-  local continue_command="$1"
-  local intro_message="$2"
-  local handoff_file token_steps
+run_stage() {
+  local stage_name="$1"
+  shift
 
-  load_env
-  sync_anyscale_cli_env
+  local log_file start_epoch end_epoch duration exit_code
+  SETUP_STAGE_INDEX=$((SETUP_STAGE_INDEX + 1))
+  log_file="${SETUP_STAGE_LOG_DIR}/$(printf '%02d' "${SETUP_STAGE_INDEX}")-${stage_name}.log"
+  start_epoch="$(date +%s)"
 
-  handoff_file="$(deploy_e2e_handoff_file)"
-  mkdir -p "$(dirname "${handoff_file}")"
+  log "[${SETUP_STAGE_INDEX}/${SETUP_STAGE_TOTAL}] ${stage_name} started"
+  set +e
+  ( "$@" ) 2>&1 | tee "${log_file}"
+  exit_code=${PIPESTATUS[0]}
+  set -e
 
-  if [[ -n "${ANYSCALE_CLI_TOKEN:-}" ]]; then
-    token_steps=$(cat <<EOF
-ANYSCALE_CLI_TOKEN is already set in ${ENV_FILE}.
+  end_epoch="$(date +%s)"
+  duration=$((end_epoch - start_epoch))
 
-If you want to rotate the token before continuing, update only ANYSCALE_CLI_TOKEN.
-EOF
-)
-  else
-    token_steps=$(cat <<EOF
-Do this now:
-  1. Open ${ENV_FILE}
-  2. Set ANYSCALE_CLI_TOKEN="<Anyscale user or service-account API key>"
-  3. Save ${ENV_FILE}
-EOF
-)
+  if [[ "${exit_code}" -eq 0 ]]; then
+    log "[${SETUP_STAGE_INDEX}/${SETUP_STAGE_TOTAL}] ${stage_name} ok (${duration}s)"
+    SETUP_STAGE_RESULTS+=("${stage_name}:PASS:${duration}s")
+    printf '%s\tPASS\t%s\t%s\n' "${stage_name}" "${duration}" "${log_file}" >> "${SETUP_RUN_DIR}/stages.tsv"
+    return 0
   fi
 
-  cat > "${handoff_file}" <<EOF
-${intro_message}
+  warn "[${SETUP_STAGE_INDEX}/${SETUP_STAGE_TOTAL}] ${stage_name} failed (${duration}s). See ${log_file}"
+  SETUP_STAGE_RESULTS+=("${stage_name}:FAIL:${duration}s")
+  printf '%s\tFAIL\t%s\t%s\n' "${stage_name}" "${duration}" "${log_file}" >> "${SETUP_RUN_DIR}/stages.tsv"
+  setup_run_summary
+  exit "${exit_code}"
+}
 
-The script has already derived these values in ${ENV_FILE}:
-  ANYSCALE_HOST="${ANYSCALE_HOST:-}"
-  ANYSCALE_CLOUD_NAME="${ANYSCALE_CLOUD_NAME:-}"
-  ANYSCALE_CLOUD_DEPLOYMENT_ID="${ANYSCALE_CLOUD_DEPLOYMENT_ID:-}"
+setup_run_summary() {
+  local result_line stage_name stage_result stage_duration
 
-${token_steps}
+  [[ -n "${SETUP_RUN_DIR}" ]] || return 0
+  {
+    printf '# Setup Run Summary\n\n'
+    printf 'Run directory: `%s`\n\n' "${SETUP_RUN_DIR}"
+    printf '| Stage | Result | Duration |\n'
+    printf '|---|---:|---:|\n'
+    for result_line in "${SETUP_STAGE_RESULTS[@]}"; do
+      IFS=':' read -r stage_name stage_result stage_duration <<<"${result_line}"
+      printf '| `%s` | %s | %s |\n' "${stage_name}" "${stage_result}" "${stage_duration}"
+    done
+  } > "${SETUP_RUN_DIR}/summary.md"
 
-Do not change ANYSCALE_HOST, ANYSCALE_CLOUD_NAME, or ANYSCALE_CLOUD_DEPLOYMENT_ID
-unless you are intentionally overriding the deployed cloud. The continuation step
-will refresh those values from Azure again if needed.
-
-Continue with:
-  ${continue_command}
-
-Part 2 will:
-  - start or reuse the Azure Bastion tunnel
-  - export a Bastion-backed kubeconfig
-  - patch the live anyscale-operator release with ANYSCALE_CLI_TOKEN
-  - register the aks-cpu and aks-gpu compute configs
-  - register the aks-cpu-workspace and aks-gpu-workspace workspaces
-  - confirm that you are ready to go with a workspace that has CPU and GPU configs ready
-
-The continuation step expects the repo-local Anyscale CLI at $(anyscale_cli_bin).
-See README.md if you still need to create .venv and install the anyscale package.
-
-Handoff file: ${handoff_file}
-EOF
-
-  cat "${handoff_file}"
+  log "Summary: ${SETUP_RUN_DIR}/summary.md"
 }
 
 deploy_e2e_cleanup() {
@@ -2612,7 +2595,7 @@ ensure_deploy_e2e_bastion_access() {
   bastion_port="${ANYSCALE_BASTION_PORT:-${DEFAULT_BASTION_TUNNEL_PORT}}"
 
   if bastion_tunnel status >/dev/null 2>&1; then
-    log "Reusing existing Bastion tunnel for deploy-e2e"
+    log "Reusing existing Bastion tunnel"
   else
     requested_bastion_port="${bastion_port}"
     if listener_is_ready "${bastion_port}" && ! port_listeners_are_bastion_tunnels "${bastion_port}"; then
@@ -2633,53 +2616,6 @@ ensure_deploy_e2e_bastion_access() {
   export_kubeconfig_env "${kubeconfig_path}"
   log "Using Bastion-backed kubeconfig ${KUBECONFIG}"
   kubectl get nodes -o wide
-}
-
-pause_for_anyscale_cli_token_if_missing() {
-  local continue_command="${1:-./scripts/setup.sh deploy-e2e --resume}"
-
-  load_env
-  sync_anyscale_cli_env
-  if [[ -n "${ANYSCALE_CLI_TOKEN:-}" ]]; then
-    return 1
-  fi
-
-  write_anyscale_cli_handoff \
-    "${continue_command}" \
-    "Anyscale post-configuration is paused because ANYSCALE_CLI_TOKEN is not set in ${ENV_FILE}."
-
-  warn "Paused before Anyscale post-configuration because ANYSCALE_CLI_TOKEN is unset."
-  return 0
-}
-
-run_anyscale_post_config_sequence() {
-  local continue_command="${1:-./scripts/setup.sh deploy-e2e --resume}"
-
-  if pause_for_anyscale_cli_token_if_missing "${continue_command}"; then
-    return 0
-  fi
-
-  ensure_deploy_e2e_bastion_access
-  log "Running Anyscale post-configuration and workspace registration"
-  anyscale_workspaces_register
-  health
-
-  log "You are ready to go with a workspace that has CPU and GPU configs ready."
-  log "CPU workspace is RUNNING; GPU workspace is registered (start it from the console or run ./scripts/setup.sh smoke-gpu)."
-}
-
-deploy_part1_handoff() {
-  local continue_command="${1:-./scripts/setup.sh deploy-part2}"
-
-  write_anyscale_cli_handoff \
-    "${continue_command}" \
-    "Part 1 is complete. Azure foundation, private AKS, Bastion access, and the Anyscale platform deployment are finished."
-
-  if [[ -z "${ANYSCALE_CLI_TOKEN:-}" ]]; then
-    warn "Part 1 finished. Update ANYSCALE_CLI_TOKEN in ${ENV_FILE}, then run ${continue_command}."
-  else
-    log "Part 1 finished. ANYSCALE_CLI_TOKEN is already set. Continue with ${continue_command} when you are ready."
-  fi
 }
 
 remove_local_terraform_state_artifacts() {
@@ -2730,196 +2666,186 @@ deploy_e2e_phase2() {
   outputs
 }
 
-deploy_e2e() {
-  local from_scratch=false
-  local resume=false
-  local force_nuke=false
+require_full_deploy_inputs() {
+  load_env
+  sync_anyscale_cli_env
+  require_env_var ANYSCALE_CLI_TOKEN
+  require_env_var ANYSCALE_CLOUD_NAME
+  require_anyscale_cli
+  require_cmd rsync
+}
 
-  while [[ $# -gt 0 ]]; do
-    case "$1" in
-      --from-scratch)
-        from_scratch=true
-        shift
-        ;;
-      --resume)
-        resume=true
-        shift
-        ;;
-      --yes|-y)
-        force_nuke=true
-        shift
-        ;;
-      --help|-h)
-        cat <<'USAGE'
-Usage:
-  ./scripts/setup.sh deploy-e2e
-  ./scripts/setup.sh deploy-e2e --from-scratch --yes
-  ./scripts/setup.sh deploy-e2e --resume
-
-Runs the supported two-phase deployment flow end to end.
-
-Default mode:
-  - preflight + init + validate
-  - phase 1 Terraform deploy (Azure foundation + private AKS only)
-  - start or reuse the Bastion tunnel and export a Bastion-backed kubeconfig
-  - phase 2 Terraform deploy (cluster bootstrap + Anyscale platform)
-  - if ANYSCALE_CLI_TOKEN is present, continue with Anyscale post-config
-  - if ANYSCALE_CLI_TOKEN is missing, stop after phase 2 and print an exact
-    handoff telling the operator how to update .env and resume
-
-Options:
-  --from-scratch  Run ./scripts/setup.sh nuke first. Use --yes to skip the prompt.
-  --resume        Skip Terraform deployment and continue from the ANYSCALE_CLI_TOKEN handoff.
-  --yes, -y       Pass --yes to nuke when used with --from-scratch.
-USAGE
-        return 0
-        ;;
-      *)
-        die "Unknown deploy-e2e option: $1"
-        ;;
-    esac
-  done
-
-  [[ "${from_scratch}" == true && "${resume}" == true ]] && die "Use either --from-scratch or --resume, not both."
-  [[ "${from_scratch}" == false && "${resume}" == false && "${force_nuke}" == true ]] && die "--yes is only valid with --from-scratch."
-
-  DEPLOY_E2E_STARTED_TUNNEL=0
-  trap deploy_e2e_cleanup EXIT
-
+deploy_prepare_stage() {
+  require_full_deploy_inputs
   preflight
+}
 
-  if [[ "${resume}" == true ]]; then
-    run_anyscale_post_config_sequence "./scripts/setup.sh deploy-e2e --resume"
+deploy_reset_stage() {
+  load_env
+  sync_anyscale_cli_env
+
+  if [[ "${DEPLOY_FROM_SCRATCH}" == true ]]; then
+    if [[ "${DEPLOY_FORCE_YES}" == true ]]; then
+      nuke --yes
+    else
+      nuke
+    fi
+  else
+    ensure_local_state_matches_target
+  fi
+}
+
+deploy_init_validate_stage() {
+  tf_init
+  validate
+}
+
+deploy_foundation_stage() {
+  load_env
+  sync_anyscale_cli_env
+
+  if aks_cluster_exists_for_target; then
+    log "Target AKS cluster $(target_aks_cluster_name) already exists. Skipping phase-1 toggle apply and reconciling phase 2."
     return 0
   fi
 
-  if [[ "${from_scratch}" == true ]]; then
-    if [[ "${force_nuke}" == true ]]; then
-      nuke --yes
-    else
-      nuke
-    fi
-  else
-    ensure_local_state_matches_target
-  fi
-
-  tf_init
-  validate
   deploy_e2e_phase1
-  deploy_e2e_phase2 1
-  run_anyscale_post_config_sequence "./scripts/setup.sh deploy-e2e --resume"
 }
 
-deploy_part1() {
-  local from_scratch=false
-  local force_nuke=false
+deploy_platform_stage() {
+  deploy_e2e_phase2
+}
+
+deploy_workspaces_stage() {
+  ensure_deploy_e2e_bastion_access
+  anyscale_workspaces_register
+}
+
+deploy_health_stage() {
+  health
+}
+
+deploy() {
+  DEPLOY_FROM_SCRATCH=false
+  DEPLOY_FORCE_YES=false
 
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --from-scratch)
-        from_scratch=true
+        DEPLOY_FROM_SCRATCH=true
         shift
         ;;
       --yes|-y)
-        force_nuke=true
+        DEPLOY_FORCE_YES=true
         shift
         ;;
       --help|-h)
         cat <<'USAGE'
 Usage:
-  ./scripts/setup.sh deploy-part1
-  ./scripts/setup.sh deploy-part1 --from-scratch --yes
+  ./scripts/setup.sh deploy
+  ./scripts/setup.sh deploy --from-scratch --yes
 
-Runs the Terraform-backed deployment flow through the manual Anyscale token handoff.
-
-Default mode:
-  - preflight + init + validate
-  - if the target AKS cluster does not exist yet, run phase 1 Terraform deploy
-    (Azure foundation + private AKS only)
-  - start or reuse the Bastion tunnel and export a Bastion-backed kubeconfig
-  - run the phase 2 Terraform reconciliation (cluster bootstrap + Anyscale platform)
-  - stop with exact instructions for the manual ANYSCALE_CLI_TOKEN handoff
-
-Options:
-  --from-scratch  Run ./scripts/setup.sh nuke first. Use --yes to skip the prompt.
-  --yes, -y       Pass --yes to nuke when used with --from-scratch.
+Runs the full private AKS + Anyscale deployment without a token pause.
+ANYSCALE_CLI_TOKEN must be present in .env before the run starts.
 USAGE
         return 0
         ;;
       *)
-        die "Unknown deploy-part1 option: $1"
+        die "Unknown deploy option: $1"
         ;;
     esac
   done
 
-  [[ "${from_scratch}" == false && "${force_nuke}" == true ]] && die "--yes is only valid with --from-scratch."
+  [[ "${DEPLOY_FROM_SCRATCH}" == false && "${DEPLOY_FORCE_YES}" == true ]] && die "--yes is only valid with --from-scratch."
 
   DEPLOY_E2E_STARTED_TUNNEL=0
   trap deploy_e2e_cleanup EXIT
 
-  preflight
+  setup_run_init "deploy" 7
+  run_stage "prepare" deploy_prepare_stage
+  run_stage "reset-or-state" deploy_reset_stage
+  run_stage "terraform-init-validate" deploy_init_validate_stage
+  run_stage "foundation" deploy_foundation_stage
+  run_stage "platform" deploy_platform_stage
+  run_stage "workspaces" deploy_workspaces_stage
+  run_stage "health" deploy_health_stage
+  setup_run_summary
 
-  if [[ "${from_scratch}" == true ]]; then
-    if [[ "${force_nuke}" == true ]]; then
-      nuke --yes
-    else
-      nuke
-    fi
-  else
-    ensure_local_state_matches_target
-  fi
-
-  tf_init
-  validate
-
-  if aks_cluster_exists_for_target; then
-    log "Target AKS cluster $(target_aks_cluster_name) already exists. Skipping the phase-1 toggle apply and reconciling phase 2 to keep part 1 idempotent."
-  else
-    deploy_e2e_phase1
-  fi
-
-  deploy_e2e_phase2 1
-  run_anyscale_post_config_sequence "./scripts/setup.sh deploy"
+  log "Deployment complete. Run ./scripts/setup.sh verify --full, then ./scripts/setup.sh workload proof all."
 }
 
-deploy_part2() {
+verify_static_stage() {
+  preflight
+  tf_init
+  validate
+}
+
+verify_live_stage() {
+  health
+  if [[ "${VERIFY_SKIP_OBSERVABILITY}" == true ]]; then
+    validate_focused --skip-observability
+  else
+    validate_focused
+  fi
+}
+
+verify() {
+  local mode="full"
+  VERIFY_SKIP_OBSERVABILITY=false
+
   while [[ $# -gt 0 ]]; do
     case "$1" in
+      --static)
+        mode="static"
+        shift
+        ;;
+      --live)
+        mode="live"
+        shift
+        ;;
+      --full)
+        mode="full"
+        shift
+        ;;
+      --skip-observability)
+        VERIFY_SKIP_OBSERVABILITY=true
+        shift
+        ;;
       --help|-h)
         cat <<'USAGE'
 Usage:
-  ./scripts/setup.sh deploy-part2
-
-Continues from the manual ANYSCALE_CLI_TOKEN handoff.
-
-This command is designed to be safe to rerun after phase-2 or post-config changes.
-
-What it does:
-  - preflight
-  - terraform init + validate
-  - start or reuse the Bastion tunnel and export a Bastion-backed kubeconfig
-  - rerun the phase 2 Terraform reconciliation
-  - patch the live anyscale-operator release with ANYSCALE_CLI_TOKEN
-  - create or reuse the aks-cpu and aks-gpu compute configs
-  - create or reuse the aks-cpu-workspace and aks-gpu-workspace workspaces
-  - confirm that you are ready to go with a workspace that has CPU and GPU configs ready
+  ./scripts/setup.sh verify --static
+  ./scripts/setup.sh verify --live [--skip-observability]
+  ./scripts/setup.sh verify --full [--skip-observability]
 USAGE
         return 0
         ;;
       *)
-        die "Unknown deploy-part2 option: $1"
+        die "Unknown verify option: $1"
         ;;
     esac
   done
 
-  DEPLOY_E2E_STARTED_TUNNEL=0
-  trap deploy_e2e_cleanup EXIT
+  case "${mode}" in
+    static)
+      setup_run_init "verify-static" 1
+      run_stage "static" verify_static_stage
+      ;;
+    live)
+      setup_run_init "verify-live" 1
+      run_stage "live" verify_live_stage
+      ;;
+    full)
+      setup_run_init "verify-full" 2
+      run_stage "static" verify_static_stage
+      run_stage "live" verify_live_stage
+      ;;
+    *)
+      die "Unknown verify mode: ${mode}"
+      ;;
+  esac
 
-  preflight
-  tf_init
-  validate
-  deploy_e2e_phase2 1
-  run_anyscale_post_config_sequence "./scripts/setup.sh deploy-part2"
+  setup_run_summary
 }
 
 ###############################################################################
@@ -2942,7 +2868,7 @@ status() {
   cluster="$(terraform_output_raw aks_cluster_name)"
   private_fqdn="$(terraform_output_raw aks_private_fqdn)"
 
-  [[ -n "${resource_group}" && -n "${cluster}" ]] || die "Terraform outputs are missing. Run ./scripts/setup.sh apply first."
+  [[ -n "${resource_group}" && -n "${cluster}" ]] || die "Terraform outputs are missing. Run ./scripts/setup.sh deploy first."
 
   log "Terraform deployment"
   printf '  Resource group: %s\n' "${resource_group}"
@@ -2990,7 +2916,7 @@ status() {
       log "Run ./scripts/setup.sh health for Azure, operator, workspace, and recent log checks."
     fi
   else
-    log "kubectl cannot reach the private API server from this shell. Start the Bastion shell with ./scripts/setup.sh bastion, run ./scripts/setup.sh kubeconfig inside it, then rerun status."
+    log "kubectl cannot reach the private API server from this shell. Run ./scripts/setup.sh verify --live to refresh Bastion-backed access and retry live checks."
   fi
 }
 
@@ -3000,6 +2926,7 @@ health() {
   local resource_group cluster namespace extension_name cloud_resource_id cli_bin
   local aks_provisioning_state aks_power_state extension_state cloud_state
   local cpu_status_raw cpu_status gpu_status_raw gpu_status
+  local cpu_health_wait_log gpu_health_wait_log
   local cpu_head_pod operator_log_matches workspace_log_matches
 
   load_env
@@ -3018,7 +2945,7 @@ health() {
   namespace="${TF_VAR_anyscale_operator_namespace}"
   cli_bin="$(anyscale_cli_bin)"
 
-  [[ -n "${resource_group}" && -n "${cluster}" ]] || die "Terraform outputs are missing. Run ./scripts/setup.sh apply first."
+  [[ -n "${resource_group}" && -n "${cluster}" ]] || die "Terraform outputs are missing. Run ./scripts/setup.sh deploy first."
   [[ -n "${extension_name}" ]] || die "Missing anyscale_extension_name Terraform output."
   [[ -n "${cloud_resource_id}" ]] || die "Missing anyscale_cloud_resource_id Terraform output."
 
@@ -3071,13 +2998,13 @@ health() {
 
   if [[ "${cpu_status}" == "RUNNING" ]]; then
     log "CPU workspace ${cpu_workspace_name} API status=${cpu_status}."
-  elif anyscale_workspace_runtime_ready_on_cluster "${cpu_workspace_name}"; then
-    warn "CPU workspace ${cpu_workspace_name} API status is ${cpu_status}, but the Ray head pod is Ready and ray status succeeds on-cluster."
-  elif [[ "${cpu_status}" =~ ^(CREATE_FAILED|FAILED|ERROR|TERMINATED|TERMINATING)$ ]]; then
+  elif [[ "${cpu_status}" =~ ^(CREATE_FAILED|FAILED|ERROR|TERMINATED)$ ]]; then
     die "CPU workspace ${cpu_workspace_name} is unhealthy with API status ${cpu_status}."
   else
-    die "CPU workspace ${cpu_workspace_name} is not ready yet; API status=${cpu_status}."
+    warn "CPU workspace ${cpu_workspace_name} API status is ${cpu_status}; confirming readiness from the Kubernetes runtime."
   fi
+  cpu_health_wait_log="$(harness_state_file "${cpu_workspace_name}.health.wait.log")"
+  wait_for_workspace_runtime_stable "${cpu_workspace_name}" "aks-cpu-" "${cpu_health_wait_log}"
 
   gpu_status_raw="$(run_with_timeout "${SETUP_TIMEOUT_ANYSCALE_COMMAND_SECONDS}" \
     "${cli_bin}" workspace_v2 status \
@@ -3087,13 +3014,18 @@ health() {
   [[ -n "${gpu_status}" ]] || gpu_status="UNKNOWN"
 
   case "${gpu_status}" in
-    CREATE_FAILED|FAILED|ERROR)
+    CREATE_FAILED|FAILED|ERROR|TERMINATED)
       die "GPU workspace ${gpu_workspace_name} is unhealthy with API status ${gpu_status}."
       ;;
-    *)
+    RUNNING)
       log "GPU workspace ${gpu_workspace_name} API status=${gpu_status}."
       ;;
+    *)
+      warn "GPU workspace ${gpu_workspace_name} API status is ${gpu_status}; confirming readiness from the Kubernetes runtime."
+      ;;
   esac
+  gpu_health_wait_log="$(harness_state_file "${gpu_workspace_name}.health.wait.log")"
+  wait_for_workspace_runtime_stable "${gpu_workspace_name}" "aks-gput4-" "${gpu_health_wait_log}"
 
   operator_log_matches="$(kubectl logs -n "${namespace}" deploy/anyscale-operator -c operator --since=30m 2>&1 \
     | egrep -i 'error|warn|fail|exception|backoff|forbidden' \
@@ -3356,7 +3288,7 @@ USAGE
 
   rg="$(resolve_aks_context resource_group_name)"
   cluster="$(resolve_aks_context aks_cluster_name)"
-  [[ -n "${rg}" && -n "${cluster}" ]] || die "Terraform outputs are missing. Run ./scripts/setup.sh apply first."
+  [[ -n "${rg}" && -n "${cluster}" ]] || die "Terraform outputs are missing. Run ./scripts/setup.sh deploy first."
 
   if [[ "${admin}" == true ]]; then
     kubeconfig_file="$(bastion_admin_kubeconfig_path)"
@@ -4021,9 +3953,9 @@ validate_observability() {
   require_cmd az
   require_cmd jq
 
-  local workspace_customer_id container_query diagnostics_query container_json diagnostics_json container_rows diagnostics_rows
+  local workspace_customer_id container_query diagnostics_query container_json diagnostics_json container_rows diagnostics_rows diagnostic_settings_count
   workspace_customer_id="$(terraform output -raw log_analytics_workspace_customer_id)"
-  [[ -n "${workspace_customer_id}" ]] || die "Missing log_analytics_workspace_customer_id output. Run ./scripts/setup.sh apply first."
+  [[ -n "${workspace_customer_id}" ]] || die "Missing log_analytics_workspace_customer_id output. Run ./scripts/setup.sh deploy first."
 
   container_query='ContainerLogV2 | where TimeGenerated > ago(2h) | summarize Records=count(), Namespaces=make_set(PodNamespace, 10), Sample=any(LogMessage)'
   diagnostics_query='union isfuzzy=true withsource=TableName AzureDiagnostics, AzureMetrics, StorageBlobLogs, ContainerRegistryLoginEvents, ContainerRegistryRepositoryEvents, MicrosoftAzureBastionAuditLogs | where TimeGenerated > ago(2h) | summarize Records=count() by TableName | order by Records desc'
@@ -4034,11 +3966,17 @@ validate_observability() {
   container_rows="$(jq -r 'def n: tonumber? // 0; if type == "array" then (.[0].Records? | n) else (.tables[0].rows[0][0] | n) end' <<<"${container_json}")"
   [[ "${container_rows}" =~ ^[0-9]+$ && "${container_rows}" -gt 0 ]] || die "ContainerLogV2 has no records yet. Run this again after Azure Monitor ingestion catches up."
 
-  log "Querying diagnostic tables in Log Analytics"
-  diagnostics_json="$(az monitor log-analytics query --workspace "${workspace_customer_id}" --analytics-query "${diagnostics_query}" --output json --only-show-errors)"
-  jq . <<<"${diagnostics_json}"
-  diagnostics_rows="$(jq -r 'def n: tonumber? // 0; if type == "array" then ([.[].Records? | n] | add // 0) else ([.tables[0].rows[]?[1] | n] | add // 0) end' <<<"${diagnostics_json}")"
-  [[ "${diagnostics_rows}" =~ ^[0-9]+$ && "${diagnostics_rows}" -gt 0 ]] || die "Diagnostic tables have no records yet. Generate traffic and run this again after ingestion catches up."
+  diagnostic_settings_count="$(terraform output -json private_mode_validation \
+    | jq -r '[.. | objects | .diagnostic_settings_enabled? // empty | select(. == true)] | length')"
+  if [[ "${diagnostic_settings_count}" -gt 0 ]]; then
+    log "Querying diagnostic tables in Log Analytics"
+    diagnostics_json="$(az monitor log-analytics query --workspace "${workspace_customer_id}" --analytics-query "${diagnostics_query}" --output json --only-show-errors)"
+    jq . <<<"${diagnostics_json}"
+    diagnostics_rows="$(jq -r 'def n: tonumber? // 0; if type == "array" then ([.[].Records? | n] | add // 0) else ([.tables[0].rows[]?[1] | n] | add // 0) end' <<<"${diagnostics_json}")"
+    [[ "${diagnostics_rows}" =~ ^[0-9]+$ && "${diagnostics_rows}" -gt 0 ]] || die "Diagnostic tables have no records yet. Generate traffic and run this again after ingestion catches up."
+  else
+    log "Terraform-managed diagnostic settings are disabled; skipping diagnostic table query."
+  fi
 
   log "Observability validation completed."
 }
@@ -4122,8 +4060,8 @@ write_anyscale_compute_config_file() {
 cloud: ${ANYSCALE_CLOUD_NAME}
 head_node:
   required_resources:
-    CPU: 8
-    memory: 32Gi
+    CPU: 4
+    memory: 16Gi
   advanced_instance_config:
     spec:
       nodeSelector:
@@ -4131,8 +4069,8 @@ head_node:
 worker_nodes:
   - name: cpu-workers
     required_resources:
-      CPU: 8
-      memory: 32Gi
+      CPU: 4
+      memory: 16Gi
     min_nodes: 1
     max_nodes: 4
     advanced_instance_config:
@@ -4141,9 +4079,9 @@ worker_nodes:
           agentpool: cpu
   - name: gpu-workers
     required_resources:
-      CPU: 8
+      CPU: 4
       GPU: 1
-      memory: 32Gi
+      memory: 16Gi
     required_labels:
       ray.io/accelerator-type: T4
     min_nodes: 1
@@ -4159,6 +4097,9 @@ worker_nodes:
           - key: node.anyscale.com/accelerator-type
             operator: Exists
             effect: NoSchedule
+          - key: node.anyscale.com/capacity-type
+            operator: Exists
+            effect: NoSchedule
 EOF
       ;;
     cpu)
@@ -4166,8 +4107,8 @@ EOF
 cloud: ${ANYSCALE_CLOUD_NAME}
 head_node:
   required_resources:
-    CPU: 8
-    memory: 32Gi
+    CPU: 4
+    memory: 16Gi
   advanced_instance_config:
     spec:
       nodeSelector:
@@ -4175,8 +4116,8 @@ head_node:
 worker_nodes:
   - name: cpu-workers
     required_resources:
-      CPU: 8
-      memory: 32Gi
+      CPU: 4
+      memory: 16Gi
     min_nodes: 1
     max_nodes: 1
     advanced_instance_config:
@@ -4190,8 +4131,8 @@ EOF
 cloud: ${ANYSCALE_CLOUD_NAME}
 head_node:
   required_resources:
-    CPU: 8
-    memory: 32Gi
+    CPU: 4
+    memory: 16Gi
   advanced_instance_config:
     spec:
       nodeSelector:
@@ -4199,9 +4140,9 @@ head_node:
 worker_nodes:
   - name: gpu-workers
     required_resources:
-      CPU: 8
+      CPU: 4
       GPU: 1
-      memory: 32Gi
+      memory: 16Gi
     required_labels:
       ray.io/accelerator-type: T4
     min_nodes: 1
@@ -4215,6 +4156,9 @@ worker_nodes:
             operator: Exists
             effect: NoSchedule
           - key: node.anyscale.com/accelerator-type
+            operator: Exists
+            effect: NoSchedule
+          - key: node.anyscale.com/capacity-type
             operator: Exists
             effect: NoSchedule
 EOF
@@ -4247,6 +4191,29 @@ anyscale_compute_config_worker_min_nodes_signature_from_output() {
   ' | sort
 }
 
+anyscale_compute_config_output_matches_profile() {
+  local raw_output="$1"
+  local profile="$2"
+
+  grep -q 'CPU: 4' <<<"${raw_output}" || return 1
+  grep -q 'memory: 16Gi' <<<"${raw_output}" || return 1
+  ! grep -Eq 'CPU: 8|memory: 32Gi' <<<"${raw_output}" || return 1
+
+  case "${profile}" in
+    mixed)
+      grep -q 'GPU: 1' <<<"${raw_output}" || return 1
+      grep -q 'node.anyscale.com/capacity-type' <<<"${raw_output}" || return 1
+      ;;
+    gpu)
+      grep -q 'GPU: 1' <<<"${raw_output}" || return 1
+      grep -q 'node.anyscale.com/capacity-type' <<<"${raw_output}" || return 1
+      ;;
+    cpu)
+      ! grep -q 'GPU: 1' <<<"${raw_output}" || return 1
+      ;;
+  esac
+}
+
 ensure_anyscale_compute_config() {
   local compute_config_name="$1"
   local cli_bin="$2"
@@ -4265,7 +4232,8 @@ ensure_anyscale_compute_config() {
     current_worker_min_nodes="$(anyscale_compute_config_worker_min_nodes_signature_from_output "${get_output}")"
     if grep -q 'required_resources' <<<"${get_output}" \
       && ! grep -Eq 'instance_type:|14CPU-56GB-CPU|8CPU-32GB-1xT4-AKS' <<<"${get_output}" \
-      && [[ "${current_worker_min_nodes}" == "${desired_worker_min_nodes}" ]]; then
+      && [[ "${current_worker_min_nodes}" == "${desired_worker_min_nodes}" ]] \
+      && anyscale_compute_config_output_matches_profile "${get_output}" "${profile}"; then
       log "Using existing Anyscale declarative compute config ${compute_config_name}"
       return 0
     fi
@@ -4540,10 +4508,57 @@ workspace_head_pod_name() {
   namespace="${TF_VAR_anyscale_operator_namespace}"
   head_pod_name="$(kubectl get pods -n "${namespace}" \
     -l "app.kubernetes.io/name=${workspace_name},ray-node-type=head" \
-    -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)"
+    -o json 2>/dev/null \
+    | jq -r '[.items[] | select(.metadata.deletionTimestamp == null) | select(.status.phase == "Running") | select(any(.status.conditions[]?; .type == "Ready" and .status == "True"))] | sort_by(.metadata.creationTimestamp) | last | .metadata.name // empty' || true)"
 
   [[ -n "${head_pod_name}" ]] || die "Could not find a Ray head pod for workspace ${workspace_name} in namespace ${namespace}."
   printf '%s\n' "${head_pod_name}"
+}
+
+wait_for_workspace_runtime_stable() {
+  local workspace_name="$1"
+  local worker_node_prefix="$2"
+  local wait_log="$3"
+  local namespace deadline current_epoch snapshot_json terminating_count head_name worker_line stable_count=0 previous_summary=""
+
+  namespace="${TF_VAR_anyscale_operator_namespace}"
+  deadline=$(( $(date +%s) + SETUP_TIMEOUT_ANYSCALE_WORKSPACE_WAIT_SECONDS ))
+  : > "${wait_log}.runtime-stable"
+
+  while true; do
+    snapshot_json="$(kubectl get pods -n "${namespace}" \
+      -l "app.kubernetes.io/name=${workspace_name}" \
+      -o json 2>/dev/null || true)"
+    terminating_count="$(jq -r '[.items[] | select(.metadata.deletionTimestamp != null)] | length' <<<"${snapshot_json}")"
+    head_name="$(jq -r '[.items[] | select(.metadata.labels["ray-node-type"] == "head") | select(.metadata.deletionTimestamp == null) | select(.status.phase == "Running") | select(any(.status.conditions[]?; .type == "Ready" and .status == "True"))] | sort_by(.metadata.creationTimestamp) | last | .metadata.name // empty' <<<"${snapshot_json}")"
+    worker_line="$(jq -r --arg prefix "${worker_node_prefix}" '[.items[] | select(.metadata.labels["ray-node-type"] == "worker") | select(.metadata.deletionTimestamp == null) | select(.status.phase == "Running") | select(any(.status.conditions[]?; .type == "Ready" and .status == "True")) | select(.spec.nodeName | startswith($prefix))] | sort_by(.metadata.creationTimestamp) | last | if . == null then "" else [.metadata.name, .spec.nodeName, .status.podIP] | @tsv end' <<<"${snapshot_json}")"
+
+    printf 'terminating=%s head=%s worker=%s\n' "${terminating_count}" "${head_name}" "${worker_line}" >> "${wait_log}.runtime-stable"
+
+    if [[ "${terminating_count}" == "0" && -n "${head_name}" && -n "${worker_line}" ]] \
+      && anyscale_workspace_runtime_ready_on_cluster "${workspace_name}"; then
+      stable_count=$((stable_count + 1))
+      if (( stable_count >= 2 )); then
+        log "Workspace ${workspace_name} runtime is stable with worker on ${worker_node_prefix}*."
+        return 0
+      fi
+    else
+      stable_count=0
+    fi
+
+    summary="terminating=${terminating_count} head=${head_name:-none} worker=${worker_line:-none} stable=${stable_count}/2"
+    if [[ "${summary}" != "${previous_summary}" ]]; then
+      log "Waiting for workspace ${workspace_name} runtime stability: ${summary}"
+      previous_summary="${summary}"
+    fi
+
+    current_epoch=$(date +%s)
+    if (( current_epoch >= deadline )); then
+      die "Workspace ${workspace_name} runtime did not become stable. See ${wait_log}.runtime-stable."
+    fi
+
+    sleep 15
+  done
 }
 
 workspace_exec_head_bash() {
@@ -4623,158 +4638,15 @@ run_workspace_cpu_probe_with_retries() {
 }
 
 ###############################################################################
-anyscale_workspace_create() {
-  local workspace_name=""
-  local compute_config_name="aks-cpu"
-  local start_workspace=false
-  local cli_bin create_log start_log
-  local create_output create_status=0
-  local start_output
-
-  while [[ $# -gt 0 ]]; do
-    case "$1" in
-      --name)
-        [[ $# -ge 2 ]] || die "Missing value for --name"
-        workspace_name="$2"
-        shift 2
-        ;;
-      --compute-config)
-        [[ $# -ge 2 ]] || die "Missing value for --compute-config"
-        compute_config_name="$2"
-        shift 2
-        ;;
-      --start)
-        start_workspace=true
-        shift
-        ;;
-      --help|-h)
-        cat <<'USAGE'
-Usage:
-  ./scripts/setup.sh anyscale-workspace-create --name my-workspace
-  ./scripts/setup.sh anyscale-workspace-create --name my-gpu-workspace --compute-config aks-gpu --start
-
-Creates an additional workspace through the Anyscale CLI using an existing
-named compute config on the configured cloud. This is the supported repo-level
-fallback when the Anyscale console workspace-create wizard fails to discover an
-Azure compute-config template on a manually registered AKS cloud.
-USAGE
-        return 0
-        ;;
-      *)
-        die "Unknown anyscale-workspace-create option: $1"
-        ;;
-    esac
-  done
-
-  [[ -n "${workspace_name}" ]] || die "anyscale-workspace-create requires --name"
-
-  load_env
-  sync_anyscale_cli_env
-  require_anyscale_cli
-  require_env_var ANYSCALE_CLI_TOKEN
-  require_env_var ANYSCALE_CLOUD_NAME
-
-  cli_bin="$(anyscale_cli_bin)"
-  mkdir -p "${CACHE_DIR}"
-  create_log="${CACHE_DIR}/${workspace_name}.create.log"
-  start_log="${CACHE_DIR}/${workspace_name}.start.log"
-
-  if ! run_with_timeout "${SETUP_TIMEOUT_ANYSCALE_COMMAND_SECONDS}" \
-    "${cli_bin}" compute-config get \
-      --name "${compute_config_name}" \
-      --cloud-name "${ANYSCALE_CLOUD_NAME}" >/dev/null 2>&1; then
-    die "Compute config ${compute_config_name} was not found on ${ANYSCALE_CLOUD_NAME}. Run ./scripts/setup.sh deploy-part2 or ./scripts/setup.sh anyscale-workspaces-register first, or pass an existing --compute-config."
-  fi
-
-  if run_with_timeout "${SETUP_TIMEOUT_ANYSCALE_COMMAND_SECONDS}" \
-    "${cli_bin}" workspace_v2 status \
-      --name "${workspace_name}" \
-      --cloud "${ANYSCALE_CLOUD_NAME}" >/dev/null 2>&1; then
-    log "Workspace ${workspace_name} already exists on ${ANYSCALE_CLOUD_NAME}"
-  else
-    log "Registering workspace ${workspace_name} with compute config ${compute_config_name}"
-    if ! create_output="$(run_with_timeout "${SETUP_TIMEOUT_ANYSCALE_COMMAND_SECONDS}" \
-      "${cli_bin}" workspace_v2 create \
-        --name "${workspace_name}" \
-        --compute-config "${compute_config_name}" \
-        --cloud "${ANYSCALE_CLOUD_NAME}" 2>&1)"; then
-      create_status=$?
-    fi
-    printf '%s\n' "${create_output}" | tee "${create_log}"
-    if [[ "${create_status}" -ne 0 ]] && ! grep -q 'Workspace created successfully id:' <<<"${create_output}"; then
-      die "The workspace create step failed for ${workspace_name}. See ${create_log}."
-    fi
-  fi
-
-  if [[ "${start_workspace}" != true ]]; then
-    log "Workspace ${workspace_name} is registered with compute-config ${compute_config_name}. Start it from the Anyscale console when you want to use it."
-    return 0
-  fi
-
-  log "Starting workspace ${workspace_name}"
-  if ! start_output="$(run_with_timeout "${SETUP_TIMEOUT_ANYSCALE_COMMAND_SECONDS}" \
-    "${cli_bin}" workspace_v2 start \
-      --name "${workspace_name}" \
-      --cloud "${ANYSCALE_CLOUD_NAME}" 2>&1)"; then
-    printf '%s\n' "${start_output}" | tee "${start_log}"
-    if ! grep -Eiq 'already.*running|currently in state: STARTING' <<<"${start_output}"; then
-      die "The workspace start step failed for ${workspace_name}. See ${start_log}."
-    fi
-  else
-    printf '%s\n' "${start_output}" | tee "${start_log}"
-  fi
-
-  log "Workspace ${workspace_name} is starting with compute-config ${compute_config_name}."
-}
-
-###############################################################################
 anyscale_workspaces_register() {
   local cpu_workspace_name="aks-cpu-workspace"
   local gpu_workspace_name="aks-gpu-workspace"
   local cpu_compute_config_name="aks-cpu"
   local gpu_compute_config_name="aks-gpu"
-
-  while [[ $# -gt 0 ]]; do
-    case "$1" in
-      --cpu-workspace-name)
-        [[ $# -ge 2 ]] || die "Missing value for --cpu-workspace-name"
-        cpu_workspace_name="$2"
-        shift 2
-        ;;
-      --gpu-workspace-name)
-        [[ $# -ge 2 ]] || die "Missing value for --gpu-workspace-name"
-        gpu_workspace_name="$2"
-        shift 2
-        ;;
-      --cpu-compute-config)
-        [[ $# -ge 2 ]] || die "Missing value for --cpu-compute-config"
-        cpu_compute_config_name="$2"
-        shift 2
-        ;;
-      --gpu-compute-config)
-        [[ $# -ge 2 ]] || die "Missing value for --gpu-compute-config"
-        gpu_compute_config_name="$2"
-        shift 2
-        ;;
-      --help|-h)
-        cat <<'USAGE'
-Usage:
-  ./scripts/setup.sh anyscale-workspaces-register
-  ./scripts/setup.sh anyscale-workspaces-register --cpu-workspace-name my-cpu --gpu-workspace-name my-gpu
-
-Idempotently registers dedicated CPU and GPU compute configs and matching
-workspaces against the Azure-hosted Anyscale control plane. The CPU workspace
-and GPU workspace are started and validated structurally so warm CPU and GPU
-workers remain online on their expected AKS node pools. Existing compute
-configs and workspaces with the same names are reused.
-USAGE
-        return 0
-        ;;
-      *)
-        die "Unknown anyscale-workspaces-register option: $1"
-        ;;
-    esac
-  done
+  local cli_bin namespace
+  local cpu_compute_config_file gpu_compute_config_file
+  local cpu_create_log cpu_start_log cpu_wait_log cpu_validate_log
+  local gpu_create_log gpu_start_log gpu_wait_log gpu_validate_log
 
   load_env
   sync_anyscale_cli_env
@@ -4784,11 +4656,6 @@ USAGE
   require_env_var ANYSCALE_CLI_TOKEN
   require_env_var ANYSCALE_CLOUD_NAME
   require_env_var ANYSCALE_CLOUD_DEPLOYMENT_ID
-
-  local cli_bin namespace
-  local cpu_compute_config_file gpu_compute_config_file
-  local cpu_create_log cpu_start_log cpu_wait_log cpu_validate_log
-  local gpu_create_log gpu_start_log gpu_wait_log gpu_validate_log
 
   cli_bin="$(anyscale_cli_bin)"
   namespace="${TF_VAR_anyscale_operator_namespace}"
@@ -4809,14 +4676,15 @@ USAGE
     local workspace_name="$1"
     local compute_config_name="$2"
     local create_log="$3"
-    local create_output create_status=0
-    local workspace_json workspace_id workspace_state current_compute_config target_compute_config update_output update_log terminate_output terminate_log terminate_wait_log workspace_update_file
+    local workspace_json workspace_id workspace_state current_compute_config target_compute_config
+    local create_output create_status update_output terminate_output workspace_update_file update_log terminate_log terminate_wait_log
 
+    create_status=0
     if run_with_timeout "${SETUP_TIMEOUT_ANYSCALE_COMMAND_SECONDS}" \
       "${cli_bin}" workspace_v2 status \
         --name "${workspace_name}" \
         --cloud "${ANYSCALE_CLOUD_NAME}" >/dev/null 2>&1; then
-      log "Workspace ${workspace_name} already registered (compute-config ${compute_config_name})"
+      log "Workspace ${workspace_name} already exists"
       workspace_json="$(run_with_timeout "${SETUP_TIMEOUT_ANYSCALE_COMMAND_SECONDS}" \
         "${cli_bin}" workspace_v2 get \
           --name "${workspace_name}" \
@@ -4829,18 +4697,19 @@ USAGE
 
       if [[ -n "${workspace_id}" && -n "${target_compute_config}" && "${current_compute_config}" != "${target_compute_config}" ]]; then
         update_log="${CACHE_DIR}/${workspace_name}.update-compute-config.log"
-        workspace_update_file="${CACHE_DIR}/${workspace_name}.update-compute-config.yaml"
         terminate_log="${CACHE_DIR}/${workspace_name}.terminate-for-update.log"
         terminate_wait_log="${CACHE_DIR}/${workspace_name}.terminate-for-update.wait.log"
+        workspace_update_file="${CACHE_DIR}/${workspace_name}.update-compute-config.yaml"
+
         if [[ "${workspace_state}" != "TERMINATED" ]]; then
-          log "Terminating workspace ${workspace_name} before compute-config update (current state: ${workspace_state})"
+          log "Terminating workspace ${workspace_name} before compute-config update"
           if ! terminate_output="$(run_with_timeout "${SETUP_TIMEOUT_ANYSCALE_COMMAND_SECONDS}" \
             "${cli_bin}" workspace_v2 terminate \
               --name "${workspace_name}" \
               --cloud "${ANYSCALE_CLOUD_NAME}" 2>&1)"; then
             printf '%s\n' "${terminate_output}" | tee "${terminate_log}"
             if ! grep -Eiq 'already.*terminated|currently in state: TERMINATED' <<<"${terminate_output}"; then
-              die "The workspace terminate step failed for ${workspace_name}. See ${terminate_log}."
+              die "Workspace ${workspace_name} could not be terminated for compute-config update. See ${terminate_log}."
             fi
           else
             printf '%s\n' "${terminate_output}" | tee "${terminate_log}"
@@ -4850,21 +4719,21 @@ USAGE
             die "${workspace_name} did not reach TERMINATED before compute-config update. See ${terminate_wait_log}."
           fi
         fi
+
         write_anyscale_workspace_update_file "${workspace_json}" "${workspace_update_file}" "${compute_config_name}"
-        log "Updating workspace ${workspace_name} from ${current_compute_config:-unknown} to ${target_compute_config}"
         if ! update_output="$(run_with_timeout "${SETUP_TIMEOUT_ANYSCALE_COMMAND_SECONDS}" \
           "${cli_bin}" workspace_v2 update "${workspace_id}" \
             -f "${workspace_update_file}" \
             --compute-config "${compute_config_name}" 2>&1)"; then
           printf '%s\n' "${update_output}" | tee "${update_log}"
-          die "The workspace update step failed for ${workspace_name}. See ${update_log}."
+          die "Workspace ${workspace_name} compute-config update failed. See ${update_log}."
         fi
         printf '%s\n' "${update_output}" | tee "${update_log}"
       fi
       return 0
     fi
 
-    log "Registering workspace ${workspace_name} with compute config ${compute_config_name}"
+    log "Creating workspace ${workspace_name} with compute config ${compute_config_name}"
     if ! create_output="$(run_with_timeout "${SETUP_TIMEOUT_ANYSCALE_COMMAND_SECONDS}" \
       "${cli_bin}" workspace_v2 create \
         --name "${workspace_name}" \
@@ -4874,7 +4743,7 @@ USAGE
     fi
     printf '%s\n' "${create_output}" | tee "${create_log}"
     if [[ "${create_status}" -ne 0 ]] && ! grep -q 'Workspace created successfully id:' <<<"${create_output}"; then
-      die "The workspace create step failed for ${workspace_name}. See ${create_log}."
+      die "Workspace ${workspace_name} creation failed. See ${create_log}."
     fi
   }
 
@@ -4883,14 +4752,13 @@ USAGE
     local start_log="$2"
     local start_output
 
-    log "Starting workspace ${workspace_name} for warm-capacity validation"
     if ! start_output="$(run_with_timeout "${SETUP_TIMEOUT_ANYSCALE_COMMAND_SECONDS}" \
       "${cli_bin}" workspace_v2 start \
         --name "${workspace_name}" \
         --cloud "${ANYSCALE_CLOUD_NAME}" 2>&1)"; then
       printf '%s\n' "${start_output}" | tee "${start_log}"
-      if ! grep -Eiq 'already.*running|currently in state: STARTING' <<<"${start_output}"; then
-        die "The workspace start step failed for ${workspace_name}. See ${start_log}."
+      if ! grep -Eiq 'already.*running|currently in state: STARTING|currently in state: RUNNING' <<<"${start_output}"; then
+        die "Workspace ${workspace_name} start failed. See ${start_log}."
       fi
     else
       printf '%s\n' "${start_output}" | tee "${start_log}"
@@ -4901,72 +4769,53 @@ USAGE
     local workspace_name="$1"
     local wait_log="$2"
 
-    log "Waiting for ${workspace_name} to reach RUNNING"
     if ! wait_for_anyscale_workspace_running "${workspace_name}" "${cli_bin}" "${wait_log}"; then
       printf '%s\n' "${ANYSCALE_WORKSPACE_WAIT_RESULT}" | tee -a "${wait_log}"
-      die "${workspace_name} did not reach RUNNING. See ${wait_log}."
+      die "Workspace ${workspace_name} did not reach RUNNING. See ${wait_log}."
     fi
     printf '%s\n' "${ANYSCALE_WORKSPACE_WAIT_RESULT}" | tee -a "${wait_log}"
   }
 
-  wait_for_workspace_worker_on_node_prefix() {
+  validate_workspace_warm_capacity() {
     local workspace_name="$1"
-    local node_prefix="$2"
-    local deadline current_epoch worker_line
+    local worker_node_prefix="$2"
+    local validate_log="$3"
+    local deadline current_epoch head_pod head_node worker_line
 
+    head_pod="$(workspace_head_pod_name "${workspace_name}")"
+    head_node="$(kubectl get pod -n "${namespace}" "${head_pod}" -o jsonpath='{.spec.nodeName}')"
     deadline=$(( $(date +%s) + SETUP_TIMEOUT_ANYSCALE_WORKSPACE_WAIT_SECONDS ))
 
     while true; do
       worker_line="$(kubectl get pods -n "${namespace}" \
         -l "app.kubernetes.io/name=${workspace_name},ray-node-type=worker" \
         -o wide --no-headers 2>/dev/null \
-        | awk -v prefix="${node_prefix}" '$3 == "Running" && $7 ~ "^"prefix {print; exit}')"
+        | awk -v prefix="${worker_node_prefix}" '$3 == "Running" && $7 ~ "^"prefix {print; exit}')"
       if [[ -n "${worker_line}" ]]; then
-        printf '%s\n' "${worker_line}"
+        {
+          printf 'workspace=%s\n' "${workspace_name}"
+          printf 'head_pod=%s\n' "${head_pod}"
+          printf 'head_node=%s\n' "${head_node}"
+          printf 'worker=%s\n' "${worker_line}"
+          kubectl get pods -n "${namespace}" -l "app.kubernetes.io/name=${workspace_name}" -o wide
+        } 2>&1 | tee "${validate_log}"
         return 0
       fi
 
-      current_epoch=$(date +%s)
+      current_epoch="$(date +%s)"
       if (( current_epoch >= deadline )); then
-        return 1
+        {
+          printf 'workspace=%s\n' "${workspace_name}"
+          printf 'head_pod=%s\n' "${head_pod}"
+          printf 'head_node=%s\n' "${head_node}"
+          printf 'missing_worker_prefix=%s\n' "${worker_node_prefix}"
+          kubectl get pods -n "${namespace}" -l "app.kubernetes.io/name=${workspace_name}" -o wide
+        } 2>&1 | tee "${validate_log}"
+        die "Workspace ${workspace_name} did not keep a warm worker on ${worker_node_prefix}*. See ${validate_log}."
       fi
 
       sleep 15
     done
-  }
-
-  validate_workspace_warm_capacity() {
-    local workspace_name="$1"
-    local compute_config_name="$2"
-    local head_node_prefix="$3"
-    local worker_node_prefix="$4"
-    local validate_log="$5"
-    local head_pod head_node worker_line
-
-    head_pod="$(workspace_head_pod_name "${workspace_name}")"
-    head_node="$(kubectl get pod -n "${namespace}" "${head_pod}" -o jsonpath='{.spec.nodeName}')"
-
-    [[ "${head_node}" == ${head_node_prefix}* ]] || die "Workspace ${workspace_name} head pod is running on unexpected node ${head_node}. See ${validate_log}."
-
-    if ! worker_line="$(wait_for_workspace_worker_on_node_prefix "${workspace_name}" "${worker_node_prefix}")"; then
-      {
-        printf 'workspace=%s\n' "${workspace_name}"
-        printf 'compute_config=%s\n' "${compute_config_name}"
-        printf 'head_pod=%s\n' "${head_pod}"
-        printf 'head_node=%s\n' "${head_node}"
-        kubectl get pods -n "${namespace}" -l "app.kubernetes.io/name=${workspace_name}" -o wide
-      } 2>&1 | tee "${validate_log}"
-      die "Workspace ${workspace_name} did not keep a warm worker online on ${worker_node_prefix}*. See ${validate_log}."
-    fi
-
-    {
-      printf 'workspace=%s\n' "${workspace_name}"
-      printf 'compute_config=%s\n' "${compute_config_name}"
-      printf 'head_pod=%s\n' "${head_pod}"
-      printf 'head_node=%s\n' "${head_node}"
-      printf 'worker=%s\n' "${worker_line}"
-      kubectl get pods -n "${namespace}" -l "app.kubernetes.io/name=${workspace_name}" -o wide
-    } 2>&1 | tee "${validate_log}"
   }
 
   validate_anyscale_operator_patches
@@ -4982,277 +4831,307 @@ USAGE
   wait_for_workspace_running_or_die "${cpu_workspace_name}" "${cpu_wait_log}"
   wait_for_workspace_running_or_die "${gpu_workspace_name}" "${gpu_wait_log}"
 
-  validate_workspace_warm_capacity "${cpu_workspace_name}" "${cpu_compute_config_name}" "aks-cpu-" "aks-cpu-" "${cpu_validate_log}"
-  validate_workspace_warm_capacity "${gpu_workspace_name}" "${gpu_compute_config_name}" "aks-cpu-" "aks-gput4-" "${gpu_validate_log}"
+  validate_workspace_warm_capacity "${cpu_workspace_name}" "aks-cpu-" "${cpu_validate_log}"
+  validate_workspace_warm_capacity "${gpu_workspace_name}" "aks-gput4-" "${gpu_validate_log}"
 
-  log "CPU workspace ${cpu_workspace_name} is RUNNING with a warm cpu-workers pod on the CPU node pool (compute-config ${cpu_compute_config_name})."
-  log "GPU workspace ${gpu_workspace_name} is RUNNING with a warm gpu-workers pod on the GPU node pool (compute-config ${gpu_compute_config_name})."
-  log "Run the explicit Ray CPU/GPU runtime probes from the workspace console or terminal when you want an application-level proof on top of the warm-worker validation."
-  log "Logs: ${cpu_create_log}, ${cpu_start_log}, ${cpu_wait_log}, ${cpu_validate_log}, ${gpu_create_log}, ${gpu_start_log}, ${gpu_wait_log}, ${gpu_validate_log}"
+  log "CPU workspace ${cpu_workspace_name} and GPU workspace ${gpu_workspace_name} are registered, running, and warm on the expected node pools."
 }
 
 ###############################################################################
-anyscale_workspaces_runtime_proof() {
-  local action="all"
-  local cpu_workspace_name="aks-cpu-workspace"
-  local gpu_workspace_name="aks-gpu-workspace"
-  local gpu_node_prefix="aks-gput4-"
-  local max_attempts="${ANYSCALE_WORKSPACE_PROOF_MAX_ATTEMPTS:-30}"
-  local interval_seconds="${ANYSCALE_WORKSPACE_PROOF_INTERVAL_SECONDS:-30}"
-  local command_timeout_seconds="${ANYSCALE_WORKSPACE_PROOF_COMMAND_TIMEOUT_SECONDS:-600}"
+workload_require_inputs() {
+  load_env
+  sync_anyscale_cli_env
+  require_anyscale_cli
+  require_cmd jq
+  require_cmd rsync
+  require_env_var ANYSCALE_CLI_TOKEN
+  require_env_var ANYSCALE_CLOUD_NAME
+  [[ -f "${ROOT_DIR}/workloads/proofs/cpu_ray_proof.py" ]] || die "Missing workloads/proofs/cpu_ray_proof.py"
+  [[ -f "${ROOT_DIR}/workloads/proofs/gpu_ray_proof.py" ]] || die "Missing workloads/proofs/gpu_ray_proof.py"
+}
 
-  if [[ $# -gt 0 && "$1" != --* ]]; then
-    action="$1"
-    shift
+workload_prepare_stage() {
+  workload_require_inputs
+  ensure_deploy_e2e_bastion_access
+}
+
+workload_workspace_id() {
+  local cli_bin="$1"
+  local workspace_name="$2"
+
+  run_with_timeout "${SETUP_TIMEOUT_ANYSCALE_COMMAND_SECONDS}" \
+    "${cli_bin}" workspace_v2 get \
+      --name "${workspace_name}" \
+      --cloud "${ANYSCALE_CLOUD_NAME}" \
+      --json \
+    | jq -r '.id // empty'
+}
+
+ensure_workload_workspace_running() {
+  local workspace_name="$1"
+  local cli_bin="$2"
+  local wait_log="$3"
+  local start_output
+
+  log "Starting or reusing workspace ${workspace_name}"
+  if ! start_output="$(run_with_timeout "${SETUP_TIMEOUT_ANYSCALE_COMMAND_SECONDS}" \
+    "${cli_bin}" workspace_v2 start \
+      --name "${workspace_name}" \
+      --cloud "${ANYSCALE_CLOUD_NAME}" 2>&1)"; then
+    printf '%s\n' "${start_output}" | tee "${wait_log}.start"
+    if ! grep -Eiq 'already.*running|currently in state: STARTING|currently in state: RUNNING' <<<"${start_output}"; then
+      die "Workspace ${workspace_name} could not be started. See ${wait_log}.start."
+    fi
+  else
+    printf '%s\n' "${start_output}" | tee "${wait_log}.start"
   fi
+
+  if ! wait_for_anyscale_workspace_running "${workspace_name}" "${cli_bin}" "${wait_log}"; then
+    printf '%s\n' "${ANYSCALE_WORKSPACE_WAIT_RESULT}" | tee -a "${wait_log}"
+    die "Workspace ${workspace_name} did not reach RUNNING. See ${wait_log}."
+  fi
+  printf '%s\n' "${ANYSCALE_WORKSPACE_WAIT_RESULT}" | tee -a "${wait_log}"
+}
+
+wait_for_workload_workspace_command_ready() {
+  local workspace_name="$1"
+  local cli_bin="$2"
+  local wait_log="$3"
+  local deadline current_epoch probe_output previous_message=""
+
+  deadline=$(( $(date +%s) + SETUP_TIMEOUT_ANYSCALE_WORKSPACE_WAIT_SECONDS ))
+
+  while true; do
+    if probe_output="$(run_with_timeout "${SETUP_TIMEOUT_ANYSCALE_COMMAND_SECONDS}" \
+      "${cli_bin}" workspace_v2 run_command \
+        --name "${workspace_name}" \
+        --cloud "${ANYSCALE_CLOUD_NAME}" \
+        "true" 2>&1)"; then
+      printf '%s\n' "${probe_output}" >> "${wait_log}.command-ready"
+      log "Workspace ${workspace_name} command channel is ready."
+      return 0
+    fi
+
+    printf '%s\n' "${probe_output}" >> "${wait_log}.command-ready"
+    if [[ "${probe_output}" != "${previous_message}" ]]; then
+      warn "Workspace ${workspace_name} command channel is not ready yet; waiting before push/run_command."
+      previous_message="${probe_output}"
+    fi
+
+    current_epoch=$(date +%s)
+    if (( current_epoch >= deadline )); then
+      die "Workspace ${workspace_name} command channel did not become ready. See ${wait_log}.command-ready."
+    fi
+
+    sleep 15
+  done
+}
+
+workload_remote_command() {
+  local script_name="$1"
+
+  cat <<EOF
+set -eu
+proof_file=\$(find "\$HOME" -maxdepth 4 -type f -name "${script_name}" -print -quit)
+if [ -z "\${proof_file}" ]; then
+  echo "Proof script ${script_name} was not found under \$HOME"
+  exit 1
+fi
+cd "\$(dirname "\${proof_file}")"
+python "\$(basename "\${proof_file}")"
+EOF
+}
+
+collect_workload_diagnostics() {
+  local workspace_name="$1"
+  local cli_bin="$2"
+  local diagnostics_dir="$3"
+  local workspace_id namespace
+
+  mkdir -p "${diagnostics_dir}"
+  namespace="${TF_VAR_anyscale_operator_namespace}"
+  workspace_id="$(workload_workspace_id "${cli_bin}" "${workspace_name}" 2>/dev/null || true)"
+
+  if [[ -n "${workspace_id}" ]]; then
+    run_with_timeout "${SETUP_TIMEOUT_ANYSCALE_COMMAND_SECONDS}" \
+      "${cli_bin}" logs workspace \
+        --id "${workspace_id}" \
+        --tail 200 \
+      > "${diagnostics_dir}/anyscale-workspace.tail.log" 2>&1 || true
+
+    run_with_timeout "${SETUP_TIMEOUT_ANYSCALE_COMMAND_SECONDS}" \
+      "${cli_bin}" logs workspace \
+        --id "${workspace_id}" \
+        --download \
+        --download-dir "${diagnostics_dir}/anyscale-workspace-logs" \
+      > "${diagnostics_dir}/anyscale-workspace-download.log" 2>&1 || true
+  fi
+
+  kubectl get pods -n "${namespace}" \
+    -l "app.kubernetes.io/name=${workspace_name}" \
+    -o wide > "${diagnostics_dir}/pods.txt" 2>&1 || true
+  kubectl describe pods -n "${namespace}" \
+    -l "app.kubernetes.io/name=${workspace_name}" \
+    > "${diagnostics_dir}/pods.describe.txt" 2>&1 || true
+  kubectl logs -n "${namespace}" \
+    -l "app.kubernetes.io/name=anyscale-operator" \
+    --tail=200 > "${diagnostics_dir}/anyscale-operator.log" 2>&1 || true
+  kubectl logs -n "${namespace}" \
+    -l "app.kubernetes.io/name=${workspace_name}" \
+    --all-containers=true \
+    --tail=200 > "${diagnostics_dir}/workspace-containers.log" 2>&1 || true
+  kubectl get events -n "${namespace}" \
+    --sort-by=.lastTimestamp > "${diagnostics_dir}/events.txt" 2>&1 || true
+}
+
+run_workspace_proof() {
+  local workspace_name="$1"
+  local script_name="$2"
+  local success_marker="$3"
+  local worker_node_prefix="$4"
+  local cli_bin proof_dir output_log diagnostics_dir wait_log namespace head_pod remote_dir proof_exit
+
+  workload_require_inputs
+  ensure_deploy_e2e_bastion_access
+
+  cli_bin="$(anyscale_cli_bin)"
+  proof_dir="${ROOT_DIR}/workloads/proofs"
+  output_log="${SETUP_RUN_DIR}/${workspace_name}.${script_name}.out.log"
+  diagnostics_dir="${SETUP_RUN_DIR}/diagnostics/${workspace_name}"
+  wait_log="${SETUP_RUN_DIR}/${workspace_name}.wait.log"
+  namespace="${TF_VAR_anyscale_operator_namespace}"
+
+  ensure_workload_workspace_running "${workspace_name}" "${cli_bin}" "${wait_log}"
+  wait_for_workspace_runtime_stable "${workspace_name}" "${worker_node_prefix}" "${wait_log}"
+
+  head_pod="$(workspace_head_pod_name "${workspace_name}")"
+  remote_dir="/tmp/anyscale-proof-${script_name%.py}"
+
+  log "Copying workload proof scripts to ${workspace_name} head pod ${head_pod}"
+  run_with_timeout "${SETUP_TIMEOUT_ANYSCALE_WORKSPACE_COMMAND_SECONDS}" \
+    kubectl exec -n "${namespace}" -c ray "${head_pod}" -- \
+      bash -lc "mkdir -p '${remote_dir}'"
+  run_with_timeout "${SETUP_TIMEOUT_ANYSCALE_WORKSPACE_COMMAND_SECONDS}" \
+    kubectl cp -n "${namespace}" -c ray \
+      "${proof_dir}/." \
+      "${head_pod}:${remote_dir}/"
+
+  log "Running ${script_name} inside ${workspace_name} via Bastion-backed Kubernetes exec"
+  proof_exit=0
+  set +e
+  run_with_timeout "${WORKLOAD_COMMAND_TIMEOUT_SECONDS}" \
+    kubectl exec -n "${namespace}" -c ray "${head_pod}" -- \
+      bash -lc "cd '${remote_dir}' && python '${script_name}'" 2>&1 | tee "${output_log}"
+  proof_exit=${PIPESTATUS[0]}
+  set -e
+
+  collect_workload_diagnostics "${workspace_name}" "${cli_bin}" "${diagnostics_dir}"
+
+  [[ "${proof_exit}" -eq 0 ]] || die "${script_name} failed on ${workspace_name}. See ${output_log} and ${diagnostics_dir}."
+  grep -q "${success_marker}" "${output_log}" || die "${script_name} did not print ${success_marker}. See ${output_log}."
+  log "${workspace_name} printed ${success_marker}. Diagnostics: ${diagnostics_dir}"
+}
+
+workload_cpu_stage() {
+  run_workspace_proof "${WORKLOAD_CPU_WORKSPACE_NAME}" "cpu_ray_proof.py" "CPU_RAY_PROOF_OK" "aks-cpu-"
+}
+
+workload_gpu_stage() {
+  run_workspace_proof "${WORKLOAD_GPU_WORKSPACE_NAME}" "gpu_ray_proof.py" "GPU_RAY_PROOF_OK" "aks-gput4-"
+}
+
+workload() {
+  local subcommand="${1:-}"
+  local target="${2:-}"
+  WORKLOAD_CPU_WORKSPACE_NAME="aks-cpu-workspace"
+  WORKLOAD_GPU_WORKSPACE_NAME="aks-gpu-workspace"
+  WORKLOAD_COMMAND_TIMEOUT_SECONDS="${ANYSCALE_WORKSPACE_PROOF_COMMAND_TIMEOUT_SECONDS:-900}"
+
+  if [[ "${subcommand}" == "--help" || "${subcommand}" == "-h" || -z "${subcommand}" ]]; then
+    cat <<'USAGE'
+Usage:
+  ./scripts/setup.sh workload proof cpu
+  ./scripts/setup.sh workload proof gpu
+  ./scripts/setup.sh workload proof all
+
+Runs deterministic Ray workload proofs in the durable Anyscale workspaces and
+writes Anyscale workspace logs plus AKS pod/operator/event diagnostics into the
+run directory.
+USAGE
+    return 0
+  fi
+
+  [[ "${subcommand}" == "proof" ]] || die "Usage: ./scripts/setup.sh workload proof {cpu|gpu|all}"
+  [[ -n "${target}" ]] || die "Usage: ./scripts/setup.sh workload proof {cpu|gpu|all}"
+  shift 2
 
   while [[ $# -gt 0 ]]; do
     case "$1" in
-      --gpu-workspace-name)
-        [[ $# -ge 2 ]] || die "Missing value for --gpu-workspace-name"
-        gpu_workspace_name="$2"
-        shift 2
-        ;;
       --cpu-workspace-name)
         [[ $# -ge 2 ]] || die "Missing value for --cpu-workspace-name"
-        cpu_workspace_name="$2"
+        WORKLOAD_CPU_WORKSPACE_NAME="$2"
         shift 2
         ;;
-      --gpu-node-prefix)
-        [[ $# -ge 2 ]] || die "Missing value for --gpu-node-prefix"
-        gpu_node_prefix="$2"
-        shift 2
-        ;;
-      --max-attempts)
-        [[ $# -ge 2 ]] || die "Missing value for --max-attempts"
-        max_attempts="$2"
-        shift 2
-        ;;
-      --interval-seconds)
-        [[ $# -ge 2 ]] || die "Missing value for --interval-seconds"
-        interval_seconds="$2"
+      --gpu-workspace-name)
+        [[ $# -ge 2 ]] || die "Missing value for --gpu-workspace-name"
+        WORKLOAD_GPU_WORKSPACE_NAME="$2"
         shift 2
         ;;
       --command-timeout-seconds)
         [[ $# -ge 2 ]] || die "Missing value for --command-timeout-seconds"
-        command_timeout_seconds="$2"
+        require_positive_integer_arg "--command-timeout-seconds" "$2"
+        WORKLOAD_COMMAND_TIMEOUT_SECONDS="$2"
         shift 2
         ;;
       --help|-h)
         cat <<'USAGE'
 Usage:
-  ./scripts/setup.sh anyscale-workspaces-runtime-proof start-gpu
-  ./scripts/setup.sh anyscale-workspaces-runtime-proof wait-gpu --max-attempts 30 --interval-seconds 30
-  ./scripts/setup.sh anyscale-workspaces-runtime-proof gpu-probe
-  ./scripts/setup.sh anyscale-workspaces-runtime-proof cpu-probe
-  ./scripts/setup.sh anyscale-workspaces-runtime-proof all
-
-Runs bounded, stepwise runtime proof commands after
-anyscale-workspaces-register has created the durable CPU/GPU workspaces.
-
-Steps:
-  start-gpu   Start aks-gpu-workspace; succeeds if it is already RUNNING/STARTING.
-  wait-gpu    Poll aks-gpu-workspace until RUNNING with a fixed max attempt count.
-  gpu-probe   Confirm the GPU workspace head is reachable, run nvidia-smi -L,
-              then run a Ray task requiring num_gpus=1 on a GPU worker.
-  cpu-probe   Optional bounded Ray CPU probe against aks-cpu-workspace.
-  all         Run start-gpu, wait-gpu, and gpu-probe in order.
+  ./scripts/setup.sh workload proof {cpu|gpu|all} [--command-timeout-seconds N]
 
 Options:
-  --gpu-workspace-name NAME        Default: aks-gpu-workspace
-  --cpu-workspace-name NAME        Default: aks-cpu-workspace
-  --gpu-node-prefix PREFIX         Default: aks-gput4-
-  --max-attempts N                 Default: 30
-  --interval-seconds N             Default: 30
-  --command-timeout-seconds N      Default: 600
+  --cpu-workspace-name NAME     Default: aks-cpu-workspace
+  --gpu-workspace-name NAME     Default: aks-gpu-workspace
+  --command-timeout-seconds N   Default: 900
 USAGE
         return 0
         ;;
       *)
-        die "Unknown anyscale-workspaces-runtime-proof option: $1"
+        die "Unknown workload proof option: $1"
         ;;
     esac
   done
 
-  require_positive_integer_arg "--max-attempts" "${max_attempts}"
-  require_positive_integer_arg "--interval-seconds" "${interval_seconds}"
-  require_positive_integer_arg "--command-timeout-seconds" "${command_timeout_seconds}"
-
-  load_env
-  sync_anyscale_cli_env
-  require_anyscale_cli
-  require_cluster_kubectl_access
-  require_env_var ANYSCALE_CLI_TOKEN
-  require_env_var ANYSCALE_CLOUD_NAME
-
-  local cli_bin namespace
-  local gpu_start_log gpu_wait_log gpu_node_log gpu_nvidia_log gpu_ray_log cpu_ray_log
-
-  cli_bin="$(anyscale_cli_bin)"
-  namespace="${TF_VAR_anyscale_operator_namespace}"
-  mkdir -p "${CACHE_DIR}"
-
-  gpu_start_log="${CACHE_DIR}/${gpu_workspace_name}.runtime.start.log"
-  gpu_wait_log="${CACHE_DIR}/${gpu_workspace_name}.runtime.wait.log"
-  gpu_node_log="${CACHE_DIR}/${gpu_workspace_name}.runtime.node.log"
-  gpu_nvidia_log="${CACHE_DIR}/${gpu_workspace_name}.nvidia-smi.log"
-  gpu_ray_log="${CACHE_DIR}/${gpu_workspace_name}.ray-gpu.log"
-  cpu_ray_log="${CACHE_DIR}/${cpu_workspace_name}.ray-cpu.log"
-
-  start_gpu_workspace() {
-    local start_output
-
-    log "Starting GPU workspace ${gpu_workspace_name}"
-    if ! start_output="$(run_with_timeout "${SETUP_TIMEOUT_ANYSCALE_COMMAND_SECONDS}" \
-      "${cli_bin}" workspace_v2 start \
-        --name "${gpu_workspace_name}" \
-        --cloud "${ANYSCALE_CLOUD_NAME}" 2>&1)"; then
-      printf '%s\n' "${start_output}" | tee "${gpu_start_log}"
-      if ! grep -Eiq 'already.*running|currently in state: STARTING|currently in state: RUNNING' <<<"${start_output}"; then
-        die "The workspace start step failed for ${gpu_workspace_name}. See ${gpu_start_log}."
-      fi
-    else
-      printf '%s\n' "${start_output}" | tee "${gpu_start_log}"
-    fi
-  }
-
-  wait_gpu_workspace() {
-    log "Waiting for ${gpu_workspace_name} to reach RUNNING (${max_attempts} attempts, ${interval_seconds}s interval)"
-    if ! wait_for_anyscale_workspace_running_attempts "${gpu_workspace_name}" "${cli_bin}" "${gpu_wait_log}" "${max_attempts}" "${interval_seconds}"; then
-      printf '%s\n' "${ANYSCALE_WORKSPACE_WAIT_RESULT}" | tee -a "${gpu_wait_log}"
-      die "${gpu_workspace_name} did not reach RUNNING. See ${gpu_wait_log}."
-    fi
-    printf '%s\n' "${ANYSCALE_WORKSPACE_WAIT_RESULT}" | tee -a "${gpu_wait_log}"
-  }
-
-  assert_gpu_head_node() {
-    local gpu_head_pod gpu_node_name
-
-    gpu_head_pod="$(workspace_head_pod_name "${gpu_workspace_name}")"
-    gpu_node_name="$(kubectl get pod -n "${namespace}" "${gpu_head_pod}" -o jsonpath='{.spec.nodeName}')"
-
-    {
-      printf 'workspace=%s\n' "${gpu_workspace_name}"
-      printf 'head_pod=%s\n' "${gpu_head_pod}"
-      printf 'head_node=%s\n' "${gpu_node_name}"
-      kubectl get pod -n "${namespace}" "${gpu_head_pod}" -o wide
-    } 2>&1 | tee "${gpu_node_log}"
-
-    log "GPU workspace ${gpu_workspace_name} head pod runs on ${gpu_node_name} (head pod placement is informational; GPU is required only for workers spawned via num_gpus=1)."
-  }
-
-  assert_gpu_worker_scheduled() {
-    local gpu_worker_count
-
-    gpu_worker_count="$(kubectl get pods -n "${namespace}" -o wide --no-headers 2>/dev/null \
-      | awk -v prefix="${gpu_node_prefix}" '$7 ~ "^"prefix {count++} END {print count+0}')"
-
-    {
-      printf 'gpu_node_prefix=%s\n' "${gpu_node_prefix}"
-      printf 'gpu_worker_pod_count=%s\n' "${gpu_worker_count}"
-      kubectl get pods -n "${namespace}" -o wide --no-headers 2>/dev/null \
-        | awk -v prefix="${gpu_node_prefix}" '$7 ~ "^"prefix {print}'
-    } 2>&1 | tee -a "${gpu_node_log}"
-
-    [[ "${gpu_worker_count}" -ge 1 ]] || die "Ray num_gpus=1 task did not schedule any pod on a ${gpu_node_prefix}* node. See ${gpu_node_log}."
-  }
-
-  run_gpu_probe() {
-    local gpu_ray_command
-
-    assert_gpu_head_node
-
-    gpu_ray_command="$(cat <<'EOF'
-python - <<'PY'
-import os
-import socket
-import ray
-
-ray.init(address="auto")
-
-@ray.remote(num_gpus=1)
-def gpu_probe():
-    return {
-        "cuda": os.environ.get("CUDA_VISIBLE_DEVICES", "none"),
-        "host": socket.gethostname(),
-    }
-
-result = ray.get(gpu_probe.remote())
-print(f"CUDA_VISIBLE_DEVICES={result['cuda']}")
-print(f"GPU_WORKER_HOSTNAME={result['host']}")
-if result["cuda"] in ("", "none"):
-    raise SystemExit("GPU_PROBE_FAILED")
-print("GPU_WORKSPACE_OK")
-PY
-EOF
-)"
-
-    local probe_attempt probe_max_attempts probe_exit
-    probe_max_attempts=4
-    for ((probe_attempt=1; probe_attempt<=probe_max_attempts; probe_attempt++)); do
-      log "Ray num_gpus=1 probe attempt ${probe_attempt}/${probe_max_attempts} on ${gpu_workspace_name}"
-      probe_exit=0
-      workspace_exec_head_bash_with_timeout "${gpu_workspace_name}" "${gpu_ray_command}" "${command_timeout_seconds}" 2>&1 | tee "${gpu_ray_log}" || probe_exit=$?
-      if [[ "${probe_exit}" -eq 0 ]] && grep -q 'GPU_WORKSPACE_OK' "${gpu_ray_log}"; then
-        break
-      fi
-      if [[ "${probe_attempt}" -eq "${probe_max_attempts}" ]]; then
-        die "Ray GPU probe failed after ${probe_max_attempts} attempts for ${gpu_workspace_name}. Last exit=${probe_exit}. See ${gpu_ray_log}."
-      fi
-      log "Probe attempt ${probe_attempt} failed (exit=${probe_exit}); waiting 30s for workspace head pod to settle and retrying"
-      sleep 30
-      wait_for_anyscale_workspace_running_attempts "${gpu_workspace_name}" "${cli_bin}" "${gpu_wait_log}" 10 30 || true
-    done
-
-    assert_gpu_worker_scheduled
-
-    log "GPU workspace ${gpu_workspace_name} passed the Ray num_gpus=1 probe and a worker pod was scheduled on a ${gpu_node_prefix}* node."
-    log "Logs: ${gpu_node_log}, ${gpu_ray_log}"
-  }
-
-  run_cpu_probe() {
-    if ! run_workspace_cpu_probe_with_retries "${cpu_workspace_name}" "${command_timeout_seconds}" "${cpu_ray_log}"; then
-      die "Ray CPU probe failed for ${cpu_workspace_name}. See ${cpu_ray_log}."
-    fi
-
-    log "CPU workspace ${cpu_workspace_name} passed the Ray num_cpus=1 probe."
-    log "Log: ${cpu_ray_log}"
-  }
-
-  case "${action}" in
-    start-gpu)
-      start_gpu_workspace
+  case "${target}" in
+    cpu)
+      setup_run_init "workload-cpu" 2
+      run_stage "prepare" workload_prepare_stage
+      run_stage "cpu-proof" workload_cpu_stage
       ;;
-    wait-gpu)
-      wait_gpu_workspace
-      ;;
-    gpu-probe)
-      run_gpu_probe
-      ;;
-    cpu-probe)
-      run_cpu_probe
+    gpu)
+      setup_run_init "workload-gpu" 2
+      run_stage "prepare" workload_prepare_stage
+      run_stage "gpu-proof" workload_gpu_stage
       ;;
     all)
-      start_gpu_workspace
-      wait_gpu_workspace
-      run_gpu_probe
+      setup_run_init "workload-all" 3
+      run_stage "prepare" workload_prepare_stage
+      run_stage "cpu-proof" workload_cpu_stage
+      run_stage "gpu-proof" workload_gpu_stage
       ;;
     *)
-      die "Unknown anyscale-workspaces-runtime-proof action: ${action}"
+      die "Unknown workload proof target: ${target}"
       ;;
   esac
+
+  setup_run_summary
 }
 
 ###############################################################################
 post() {
-  log "Kubernetes bootstrap is Terraform-managed. Re-run terraform apply to reconcile the operator service account, NVIDIA device plugin, and ingress-nginx releases."
-  log "For the simplest guided flow, run ./scripts/setup.sh deploy-part1 --from-scratch --yes, update ONLY ANYSCALE_CLI_TOKEN in .env if needed, then run ./scripts/setup.sh deploy-part2."
-  log "For the guided two-phase flow with an ANYSCALE_CLI_TOKEN pause/resume handoff, run ./scripts/setup.sh deploy-e2e --from-scratch --yes and later resume with ./scripts/setup.sh deploy-e2e --resume."
-  log "The Anyscale operator's helm values (Azure CLI token, AKS-aligned tolerations, instance-type defaults) are now Terraform-managed via the AKS extension. Re-run ./scripts/setup.sh apply to reconcile any changes."
-  log "Use ./scripts/setup.sh anyscale-workspaces-register to register the aks-cpu and aks-gpu compute configs plus the aks-cpu-workspace and aks-gpu-workspace workspaces; both are started and validated with warm workers on the expected node pools."
-  log "Use ./scripts/setup.sh health after deploys or operator changes to verify Azure resource state, operator rollouts, workspace readiness, and recent operator/workspace logs."
-  log "Use ./scripts/setup.sh smoke-gpu (or ./scripts/setup.sh anyscale-workspaces-runtime-proof start-gpu|wait-gpu|gpu-probe) to opt into the bounded GPU runtime proof. It is no longer part of the default deploy path."
-  warn "For a Bastion-backed local workflow, export TF_VAR_cluster_bootstrap with the Bastion kubeconfig path before re-running terraform apply."
+  log "Use ./scripts/setup.sh deploy to reconcile Terraform, Bastion-backed bootstrap, Anyscale platform registration, and durable CPU/GPU workspaces."
+  log "Use ./scripts/setup.sh verify --full for static and live validation."
+  log "Use ./scripts/setup.sh workload proof all for deterministic CPU/GPU Ray workload proof plus Anyscale and AKS diagnostics."
+  log "Use ./scripts/setup.sh teardown for Terraform-backed teardown, or ./scripts/setup.sh teardown --force --yes for explicit resource-group deletion."
 }
 
 functional_test() {
@@ -5268,6 +5147,45 @@ destroy() {
   bastion_tunnel stop >/dev/null 2>&1 || true
   run_with_timeout "${SETUP_TIMEOUT_TERRAFORM_DESTROY_SECONDS}" terraform destroy -auto-approve
   clear_anyscale_cloud_deployment_id
+}
+
+force_teardown_drain_anyscale_cloud() {
+  load_env
+  sync_anyscale_cli_env
+
+  anyscale_platform_enabled || {
+    log "Anyscale platform is disabled; skipping cloud drain before force teardown."
+    return 0
+  }
+
+  require_cmd az
+  require_cmd jq
+  require_env_var ANYSCALE_CLI_TOKEN
+
+  local cloud_arm_id subscription_id
+  cloud_arm_id="${ANYSCALE_CLOUD_ARM_ID:-$(default_anyscale_cloud_arm_id)}"
+  subscription_id="${AZURE_SUBSCRIPTION_ID:-${TF_VAR_azure_subscription_id}}"
+
+  export ANYSCALE_CLOUD_ARM_ID="${cloud_arm_id}"
+  export AZURE_SUBSCRIPTION_ID="${subscription_id}"
+
+  if [[ ! -x "${ROOT_DIR}/scripts/anyscale-destroy-workaround.sh" ]]; then
+    die "Missing executable Anyscale destroy workaround script."
+  fi
+
+  az account set --subscription "${subscription_id}" --only-show-errors
+  if ! az resource show --ids "${cloud_arm_id}" --only-show-errors >/dev/null 2>&1; then
+    log "Anyscale cloud resource ${cloud_arm_id} is already absent; skipping cloud drain."
+    return 0
+  fi
+
+  log "Draining Anyscale cloud before force resource-group deletion: ${ANYSCALE_CLOUD_NAME}"
+  SETUP_TIMEOUT_ANYSCALE_COMMAND_SECONDS="${SETUP_TIMEOUT_ANYSCALE_COMMAND_SECONDS}" \
+    SETUP_TIMEOUT_AZURE_COMMAND_SECONDS="${SETUP_TIMEOUT_AZURE_COMMAND_SECONDS}" \
+    run_with_timeout 2400 \
+      "${ROOT_DIR}/scripts/anyscale-destroy-workaround.sh" \
+      --timeout-seconds 1800 \
+      --poll-interval-seconds 20
 }
 
 ###############################################################################
@@ -5341,43 +5259,73 @@ USAGE
   log "Nuke completed. Run ./scripts/setup.sh init before the next plan/apply if providers are not initialized."
 }
 
+teardown() {
+  local force=false
+  local yes=false
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --force)
+        force=true
+        shift
+        ;;
+      --yes|-y)
+        yes=true
+        shift
+        ;;
+      --help|-h)
+        cat <<'USAGE'
+Usage:
+  ./scripts/setup.sh teardown
+  ./scripts/setup.sh teardown --force --yes
+
+Default teardown uses Terraform destroy, including the temporary Anyscale Azure
+cloud delete workaround. --force deletes the Azure resource group directly and
+purges local Terraform state artifacts.
+USAGE
+        return 0
+        ;;
+      *)
+        die "Unknown teardown option: $1"
+        ;;
+    esac
+  done
+
+  if [[ "${force}" == true ]]; then
+    setup_run_init "teardown-force" 2
+    run_stage "drain-anyscale-cloud" force_teardown_drain_anyscale_cloud
+    if [[ "${yes}" == true ]]; then
+      run_stage "force-delete-resource-group" nuke --yes
+    else
+      run_stage "force-delete-resource-group" nuke
+    fi
+    setup_run_summary
+    return 0
+  fi
+
+  [[ "${yes}" == true ]] && die "--yes is only valid with --force."
+  setup_run_init "teardown" 1
+  run_stage "terraform-destroy" destroy
+  setup_run_summary
+}
+
 ###############################################################################
 cmd="${1:-}"
 case "${cmd}" in
-  preflight)  preflight ;;
-  tfvars)     render_tfvars ;;
-  init)       tf_init ;;
-  validate)   validate ;;
-  plan)       plan ;;
-  apply)      apply ;;
-  deploy-part1) shift; deploy_part1 "$@" ;;
-  deploy-part2) shift; deploy_part2 "$@" ;;
-  deploy)     shift; deploy_part1 "$@" ;;
-  deploy-e2e) shift; deploy_e2e "$@" ;;
-  outputs)    outputs ;;
-  bastion)    shift; bastion "$@" ;;
-  bastion-tunnel) shift; bastion_tunnel "$@" ;;
-  kubeconfig) kubeconfig ;;
-  kubeconfig-bastion) shift; kubeconfig_bastion "$@" ;;
-  workspace-head-forward) shift; workspace_head_forward "$@" ;;
-  workspace-head-open) shift; workspace_head_open "$@" ;;
-  workspace-browser-ready) shift; workspace_browser_ready "$@" ;;
-  workspace-browser-open) shift; workspace_browser_open "$@" ;;
-  workspace-browser-tunnel) shift; workspace_browser_tunnel "$@" ;;
-  anyscale_workspace_create) shift; anyscale_workspace_create "$@" ;;
-  anyscale-workspaces-register) shift; anyscale_workspaces_register "$@" ;;
-  anyscale-workspaces-runtime-proof) shift; anyscale_workspaces_runtime_proof "$@" ;;
-  smoke-gpu) shift; anyscale_workspaces_runtime_proof all "$@" ;;
-  health)     health ;;
-  post)       post ;;
-  control-plane-egress-smoke) control_plane_egress_smoke ;;
-  validate-focused) shift; validate_focused "$@" ;;
-  validate-k8s) validate_k8s ;;
-  validate-observability) validate_observability ;;
-  functional-test) functional_test ;;
-  status)     status ;;
-  destroy)    destroy ;;
-  nuke)       shift; nuke "$@" ;;
-  all)        preflight; tf_init; validate; plan; apply; outputs ;;
-  *) die "Usage: $0 {preflight|tfvars|init|validate|plan|apply|deploy-part1|deploy-part2|deploy-e2e|outputs|bastion|bastion-tunnel|kubeconfig|kubeconfig-bastion|workspace-head-forward|workspace-head-open|workspace-browser-ready|workspace-browser-open|workspace-browser-tunnel|anyscale-workspace-create|anyscale-workspaces-register|anyscale-workspaces-runtime-proof|smoke-gpu|health|post|control-plane-egress-smoke|validate-focused|validate-k8s|validate-observability|functional-test|status|destroy|nuke|all}" ;;
+  ""|--help|-h)
+    cat <<'USAGE'
+Usage: ./scripts/setup.sh {deploy|verify|workload|teardown}
+
+Commands:
+  deploy [--from-scratch --yes]
+  verify [--static|--live|--full] [--skip-observability]
+  workload proof {cpu|gpu|all}
+  teardown [--force] [--yes]
+USAGE
+    ;;
+  deploy) shift; deploy "$@" ;;
+  verify) shift; verify "$@" ;;
+  workload) shift; workload "$@" ;;
+  teardown) shift; teardown "$@" ;;
+  *) die "Usage: $0 {deploy|verify|workload|teardown}" ;;
 esac

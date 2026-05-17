@@ -152,8 +152,8 @@ run "naming_and_validate_plan" {
   }
 
   assert {
-    condition     = output.anyscale_platform_contract.cloud_management_mode == "azapi_arm_template" && output.anyscale_platform_contract.extension_management_mode == "azurerm_kubernetes_cluster_extension" && output.anyscale_platform_contract.extension_type == "Anyscale.AKS.Operator" && output.anyscale_platform_contract.extension_release_namespace == "anyscale-operator" && output.anyscale_platform_contract.extension_service_account_name == "anyscale-operator" && contains(output.anyscale_platform_contract.dynamic_configuration_keys, "global.cloudDeploymentId") && output.anyscale_platform_contract.extension_configuration_settings["workloads.accelerator.tolerations.default[0].key"] == "node.anyscale.com/accelerator-type" && output.anyscale_platform_contract.extension_configuration_settings["workloads.accelerator.tolerations.default[1].key"] == "nvidia.com/gpu" && output.anyscale_platform_contract.extension_configuration_settings["workloads.accelerator.tolerations.default[1].operator"] == "Exists"
-    error_message = "The Anyscale contract must keep the cloud on the AzAPI ARM path, move the AKS extension to the native azurerm resource, and declaratively include the taint-toleration defaults for GPU pools."
+    condition     = output.anyscale_platform_contract.cloud_management_mode == "azapi_arm_template" && output.anyscale_platform_contract.extension_management_mode == "azurerm_kubernetes_cluster_extension" && output.anyscale_platform_contract.extension_type == "Anyscale.AKS.Operator" && output.anyscale_platform_contract.extension_release_namespace == "anyscale-operator" && output.anyscale_platform_contract.extension_service_account_name == "anyscale-operator" && contains(output.anyscale_platform_contract.dynamic_configuration_keys, "global.cloudDeploymentId") && output.anyscale_platform_contract.extension_configuration_settings["workloads.accelerator.tolerations.default[0].key"] == "node.anyscale.com/accelerator-type" && output.anyscale_platform_contract.extension_configuration_settings["workloads.accelerator.tolerations.default[1].key"] == "nvidia.com/gpu" && output.anyscale_platform_contract.extension_configuration_settings["workloads.accelerator.tolerations.default[1].operator"] == "Exists" && output.anyscale_platform_contract.destroy_workaround.enabled == true && output.anyscale_platform_contract.destroy_workaround.mode == "terraform_data_local_exec"
+    error_message = "The Anyscale contract must keep the cloud on the AzAPI ARM path, move the AKS extension to the native azurerm resource, keep the temporary pre-destroy workaround, and declaratively include the taint-toleration defaults for GPU pools."
   }
 
 }
@@ -177,7 +177,7 @@ run "anyscale_platform_native_extension_contract" {
   }
 
   assert {
-    condition     = output.anyscale_platform_contract.enabled == true && output.anyscale_platform_contract.extension_release_train == "Stable" && output.anyscale_platform_contract.extension_management_mode == "azurerm_kubernetes_cluster_extension"
-    error_message = "The enabled platform contract must normalize the release train for the native azurerm AKS extension resource."
+    condition     = output.anyscale_platform_contract.enabled == true && output.anyscale_platform_contract.extension_release_train == "Stable" && output.anyscale_platform_contract.extension_management_mode == "azurerm_kubernetes_cluster_extension" && output.anyscale_platform_contract.destroy_workaround.poll_interval_seconds == 20
+    error_message = "The enabled platform contract must normalize the release train for the native azurerm AKS extension resource and keep the temporary destroy-workaround defaults stable."
   }
 }

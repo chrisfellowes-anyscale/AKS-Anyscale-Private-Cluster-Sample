@@ -359,6 +359,11 @@ variable "anyscale_platform" {
     the portal-exported AzAPI/ARM path, but manages the AKS marketplace
     extension natively with azurerm, wired to the existing AKS cluster,
     storage account, ACR, and operator UAMI.
+
+    destroy_workaround is a temporary Azure teardown hook. It runs before
+    Terraform destroys the Anyscale cloud, extension, and AKS dependencies so
+    the current cloud can be drained while its backing resources still exist.
+    Remove it after Anyscale fixes the backend-side delete blockers on Azure.
   EOT
 
   type = object({
@@ -373,6 +378,11 @@ variable "anyscale_platform" {
     plan_product                     = optional(string, "anyscale-operator-aks")
     release_train                    = optional(string, "stable")
     tags_by_resource                 = optional(map(map(string)), {})
+    destroy_workaround = optional(object({
+      enabled                               = optional(bool, true)
+      workspace_termination_timeout_seconds = optional(number, 900)
+      poll_interval_seconds                 = optional(number, 20)
+    }), {})
   })
 
   default = {}
@@ -385,6 +395,16 @@ variable "anyscale_platform" {
   validation {
     condition     = can(regex("^[A-Za-z0-9-]+$", var.anyscale_platform.extension_resource_name))
     error_message = "anyscale_platform.extension_resource_name may contain only letters, numbers, and hyphens."
+  }
+
+  validation {
+    condition     = try(var.anyscale_platform.destroy_workaround.workspace_termination_timeout_seconds, 900) >= 60
+    error_message = "anyscale_platform.destroy_workaround.workspace_termination_timeout_seconds must be at least 60 seconds."
+  }
+
+  validation {
+    condition     = try(var.anyscale_platform.destroy_workaround.poll_interval_seconds, 20) >= 5
+    error_message = "anyscale_platform.destroy_workaround.poll_interval_seconds must be at least 5 seconds."
   }
 }
 

@@ -135,6 +135,12 @@ output "anyscale_platform_contract" {
     extension_release_train          = local.anyscale_platform_extension_release_train
     dynamic_configuration_keys       = local.anyscale_platform_extension_dynamic_configuration_keys
     extension_configuration_settings = local.anyscale_platform_extension_configuration_settings
+    destroy_workaround = {
+      enabled                               = local.anyscale_platform_destroy_workaround_enabled
+      mode                                  = "terraform_data_local_exec"
+      workspace_termination_timeout_seconds = local.anyscale_platform_destroy_workaround_timeout_seconds
+      poll_interval_seconds                 = local.anyscale_platform_destroy_workaround_poll_interval_seconds
+    }
   }
 }
 

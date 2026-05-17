@@ -1,8 +1,13 @@
 locals {
-  anyscale_platform_enabled                 = var.anyscale_platform.enabled
-  anyscale_platform_cloud_name              = coalesce(var.anyscale_platform.cloud_name, local.suffix)
-  anyscale_platform_extension_name          = var.anyscale_platform.extension_resource_name
-  anyscale_platform_extension_release_train = contains(["stable", "preview"], lower(var.anyscale_platform.release_train)) ? title(lower(var.anyscale_platform.release_train)) : var.anyscale_platform.release_train
+  anyscale_platform_enabled                                  = var.anyscale_platform.enabled
+  anyscale_platform_cloud_name                               = coalesce(var.anyscale_platform.cloud_name, local.suffix)
+  anyscale_platform_cloud_control_plane_name                 = "/subscriptions/${var.azure_subscription_id}/resourcegroups/${azurerm_resource_group.this.name}/providers/anyscale.platform/clouds/${local.anyscale_platform_cloud_name}"
+  anyscale_platform_cloud_arm_id                             = "${azurerm_resource_group.this.id}/providers/Anyscale.Platform/clouds/${local.anyscale_platform_cloud_name}"
+  anyscale_platform_extension_name                           = var.anyscale_platform.extension_resource_name
+  anyscale_platform_extension_release_train                  = contains(["stable", "preview"], lower(var.anyscale_platform.release_train)) ? title(lower(var.anyscale_platform.release_train)) : var.anyscale_platform.release_train
+  anyscale_platform_destroy_workaround_enabled               = try(var.anyscale_platform.destroy_workaround.enabled, true)
+  anyscale_platform_destroy_workaround_timeout_seconds       = try(var.anyscale_platform.destroy_workaround.workspace_termination_timeout_seconds, 900)
+  anyscale_platform_destroy_workaround_poll_interval_seconds = try(var.anyscale_platform.destroy_workaround.poll_interval_seconds, 20)
   anyscale_platform_extension_dynamic_configuration_keys = [
     "global.cloudDeploymentId",
     "global.controlPlaneURL",
@@ -169,5 +174,42 @@ resource "azurerm_kubernetes_cluster_extension" "anyscale_operator" {
   depends_on = [
     module.cluster_bootstrap,
     azurerm_marketplace_agreement.anyscale_operator,
+  ]
+}
+
+# Temporary Azure destroy workaround: run the current-cloud drain before the
+# extension, cloud resource, and AKS dependencies are torn down. Remove this
+# resource and the helper script once Anyscale fixes backend delete handling.
+resource "terraform_data" "anyscale_platform_destroy_workaround" {
+  count = local.anyscale_platform_enabled && local.anyscale_platform_destroy_workaround_enabled ? 1 : 0
+
+  input = {
+    repo_root             = abspath("${path.root}/../..")
+    anyscale_host         = var.anyscale_platform.control_plane_url
+    anyscale_cli_token    = var.anyscale_cli_token
+    anyscale_cloud_name   = local.anyscale_platform_cloud_control_plane_name
+    anyscale_cloud_arm_id = local.anyscale_platform_cloud_arm_id
+    azure_subscription_id = var.azure_subscription_id
+    timeout_seconds       = local.anyscale_platform_destroy_workaround_timeout_seconds
+    poll_interval_seconds = local.anyscale_platform_destroy_workaround_poll_interval_seconds
+  }
+
+  provisioner "local-exec" {
+    when        = destroy
+    working_dir = self.input.repo_root
+    command     = "./scripts/anyscale-destroy-workaround.sh --timeout-seconds ${self.input.timeout_seconds} --poll-interval-seconds ${self.input.poll_interval_seconds}"
+
+    environment = {
+      ANYSCALE_HOST         = self.input.anyscale_host
+      ANYSCALE_CLI_TOKEN    = self.input.anyscale_cli_token
+      ANYSCALE_CLOUD_NAME   = self.input.anyscale_cloud_name
+      ANYSCALE_CLOUD_ARM_ID = self.input.anyscale_cloud_arm_id
+      AZURE_SUBSCRIPTION_ID = self.input.azure_subscription_id
+    }
+  }
+
+  depends_on = [
+    azapi_resource.anyscale_platform,
+    azurerm_kubernetes_cluster_extension.anyscale_operator,
   ]
 }

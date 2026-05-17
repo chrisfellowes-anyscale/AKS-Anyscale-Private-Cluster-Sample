@@ -1,6 +1,6 @@
 # Private AKS foundation for Anyscale on Azure
 
-This repository builds a private Azure landing zone for running Anyscale on AKS. The stack creates the network, Azure Bastion host, Azure Firewall egress path, DNS Private Resolver, private AKS cluster, private storage account, private Azure Container Registry, Log Analytics and Container Insights wiring, and the user-assigned managed identity that the Anyscale operator uses for Azure data-plane access. It also includes the shell workflow that turns a private cluster into something an operator can deploy, validate, and smoke-test from a local machine without exposing the Kubernetes API publicly.
+This repository builds a private Azure landing zone for running Anyscale on AKS. The stack creates the network, Azure Bastion host, Azure Firewall egress path, DNS Private Resolver, private AKS cluster, private storage account, private Azure Container Registry, Log Analytics and Container Insights wiring, and the user-assigned managed identity that the Anyscale operator uses for Azure data-plane access. It also includes the shell workflow that turns a private cluster into something an operator can deploy, validate, and prove with deterministic workloads from a local machine without exposing the Kubernetes API publicly.
 
 This is an infrastructure and operator workflow repository, not an application repository and not a self-hosted Anyscale control plane. The cluster runs the operator and workloads, while the Anyscale console remains SaaS-hosted at `https://console.azure.anyscale.com`.
 
@@ -18,13 +18,13 @@ The result is intentionally opinionated. AKS stays private, the storage account 
 
 ## Prerequisites
 
-You should assume this README is the only document you need to get a fresh environment running, so start by making sure the local workstation, Azure permissions, and Anyscale inputs are in place before you touch Terraform.
+You should assume this README is the only document you need to get a fresh environment running, so start by making sure the local workstation, Azure permissions, and Anyscale inputs are in place before you deploy.
 
-For the local workstation, work from a macOS or Linux shell with Git, Azure CLI, Terraform `>= 1.9.0`, `kubectl`, `kubelogin`, `helm`, `jq`, Python `3.9+`, and `uv` installed. The private-cluster workflow also requires the Azure CLI `aks-preview` and `bastion` extensions. If you want to regenerate the architecture preview, install the draw.io or diagrams.net CLI as well.
+For the local workstation, work from a macOS or Linux shell with Git, Azure CLI, Terraform `>= 1.9.0`, `kubectl`, `kubelogin`, `helm`, `jq`, `rsync`, Python `3.9+`, and `uv` installed. The private-cluster workflow also requires the Azure CLI `aks-preview` and `bastion` extensions. If you want to regenerate the architecture preview, install the draw.io or diagrams.net CLI as well.
 
-For Azure access, you need to be able to log in to the target tenant and subscription and create the full set of resources this stack uses: networking, Azure Firewall, Azure Bastion, AKS, Private Link, storage, ACR, Log Analytics, managed identities, federated identity credentials, and RBAC assignments. If the target subscription has not already accepted the Anyscale marketplace offer, it also needs permission to create or accept that agreement during the phase-2 deployment. The sample configuration assumes GPU quota for `Standard_NC16as_T4_v3` in the target region because the default validated path keeps one T4 node warm for workspace and smoke-test bring-up.
+For Azure access, you need to be able to log in to the target tenant and subscription and create the full set of resources this stack uses: networking, Azure Firewall, Azure Bastion, AKS, Private Link, storage, ACR, Log Analytics, managed identities, federated identity credentials, RBAC assignments, and the Anyscale marketplace resources. The sample configuration assumes GPU quota for `Standard_NC16as_T4_v3` in the target region because the validated path keeps one T4 node warm for GPU workspace and workload proof bring-up.
 
-For Anyscale access, the infrastructure deployment itself does not require an API token, but the post-deploy helper commands do. `./scripts/setup.sh anyscale-workspace-ready`, `./scripts/setup.sh anyscale-workspaces-register`, and the new guided `./scripts/setup.sh deploy-part2` flow all require `ANYSCALE_CLI_TOKEN` in `.env`, and they also expect the repo-local CLI binary at `.venv/bin/anyscale`. Current Anyscale documentation says service accounts can be created with CLI, but service-account API keys are still created in the Anyscale console, so the guided repo automation intentionally splits the operator path into part 1 and part 2 around that manual handoff.
+For Anyscale access, `ANYSCALE_CLI_TOKEN` is required before `deploy` starts. The token is treated as organization-scoped for this workflow, so the script no longer pauses mid-run for a token. The repo-local CLI binary is expected at `.venv/bin/anyscale`.
 
 ## Start from a fresh clone
 
@@ -34,11 +34,9 @@ After cloning the repository, work from the repository root and create a local `
 cp .env-template .env
 ```
 
-The `.env-template` file is the source of truth for required inputs, and it is intentionally verbose. In practice you need to provide the Azure subscription and tenant IDs, choose the naming and region values, confirm the VNet and subnet CIDRs, review the outbound allowlists, replace the placeholder ownership tags, and decide whether the default AKS and GPU settings are acceptable in your region. The defaults are opinionated on purpose: they pin AKS to `1.34.6`, keep the GPU pool at `min_count=1`, enable Azure Monitor diagnostics, and default the operator identity mode to `{"mode":"create"}`.
+Fill in the Azure subscription and tenant IDs, naming and region values, VNet and subnet CIDRs, outbound allowlists, ownership tags, and any AKS/GPU sizing changes you need. The defaults are opinionated on purpose: they pin AKS to `1.34.6`, keep the GPU pool at `min_count=1`, enable Azure Monitor diagnostics, and default the operator identity mode to `{"mode":"create"}`.
 
-The Anyscale section of `.env` is much smaller than it first appears. `ANYSCALE_CLOUD_NAME` is derived from the deployed Azure resource name when it is blank, `ANYSCALE_CLOUD_DEPLOYMENT_ID` is discovered from the live platform deployment after phase 2 completes, and `ANYSCALE_CLI_TOKEN` is the only value you normally supply yourself. You can leave `ANYSCALE_CLI_TOKEN` blank for the Terraform phases and fill it in only when `./scripts/setup.sh deploy-part1` stops after phase 2 and tells you to continue with `./scripts/setup.sh deploy-part2`. The default authentication path for Terraform is `ARM_USE_CLI=true`, which means the wrapper assumes a normal local `az login`. If you need service principal, OIDC, or managed identity auth instead, the commented `ARM_*` settings in `.env-template` are the place to start.
-
-The wrapper renders `infra/terraform/terraform.auto.tfvars.json` from `.env`. You can do that explicitly with `./scripts/setup.sh tfvars`, but every major wrapper command also re-renders it automatically, so the dedicated command is mostly useful when you want to inspect the generated JSON after editing `.env`.
+In the Anyscale section, set `ANYSCALE_CLI_TOKEN` before deployment. `ANYSCALE_CLOUD_NAME` is derived when blank, and `ANYSCALE_CLOUD_DEPLOYMENT_ID` is discovered from the live Azure platform deployment. The default Terraform authentication path is `ARM_USE_CLI=true`, which means the wrapper assumes a normal local `az login`. If you need service principal, OIDC, or managed identity auth instead, the commented `ARM_*` settings in `.env-template` are the place to start.
 
 Before you deploy anything, source the environment file for convenience and authenticate Azure CLI against the target tenant.
 
@@ -47,11 +45,11 @@ source .env
 az login --tenant "$TF_VAR_azure_tenant_id"
 ```
 
-The wrapper will set the active subscription from `.env` during preflight, so you do not need to do that by hand unless you want to.
+The wrapper renders `infra/terraform/terraform.auto.tfvars.json` from `.env` automatically during deployment and validation. That generated file is ignored by Git.
 
 ## Install the repo-local Anyscale CLI
 
-If you plan to use the Anyscale post-configuration helpers or the workspace smoke test, create the repo-local virtual environment before phase 2 so `./scripts/setup.sh apply` can auto-run the operator patch when the rest of the prerequisites are already present.
+Create the repo-local virtual environment before deploy so the orchestrator can register compute configs, workspaces, and workload proof commands through the same CLI version.
 
 ```bash
 uv venv .venv
@@ -59,335 +57,80 @@ source .venv/bin/activate
 UV_CACHE_DIR="$PWD/.cache/uv-cache" uv pip install --python .venv/bin/python anyscale
 ```
 
-If you want an interactive CLI session for manual exploration, you can run `.venv/bin/anyscale login`. That is useful for ad hoc inspection, but it does not replace `ANYSCALE_CLI_TOKEN` for `anyscale-workspace-ready`, `anyscale-workspaces-register`, or `deploy-part2`; those helpers read the token from `.env` and fail fast when it is missing. The guided `deploy-part1` orchestration pauses before those steps, and `deploy-part2` still expects the repo-local CLI binary at `.venv/bin/anyscale`.
+You can still run `.venv/bin/anyscale login` for ad hoc manual exploration, but the repository automation reads `ANYSCALE_CLI_TOKEN` from `.env` and fails fast when it is missing.
 
-## Understand the deployment flow before you start
+## Deploy, verify, and prove workloads
 
-This repository uses a two-phase deployment on purpose. The Azure infrastructure, private AKS cluster, storage, registry, identity, networking, and observability resources can be created without local Kubernetes access, but the Terraform-managed bootstrap layer and the Anyscale platform deployment need a working path to the private AKS API. That path is provided by Azure Bastion and a Bastion-backed kubeconfig that points Terraform, `kubectl`, and `helm` at a local tunnel rather than at the private AKS DNS name directly.
-
-The wrapper includes `./scripts/setup.sh all`, but that command only covers the Terraform portion of the workflow. For this repository, the simplest supported guided path is `./scripts/setup.sh deploy-part1 --from-scratch --yes`, then after the manual token handoff `./scripts/setup.sh deploy-part2`. After the initial bring-up, `deploy-part2` is the preferred idempotent reconciliation command to rerun when you change phase-2 Terraform, operator settings, or workspace registration behavior. The explicit phase-1 and phase-2 sequence below remains the manual equivalent when you want tighter control over each step.
-
-## Guided two-step orchestration with token handoff
-
-If you want the repository to drive the full deployment and make the operator handoff dead simple, use the two-step wrapper.
+The visible operator surface is intentionally small:
 
 ```bash
-./scripts/setup.sh deploy-part1 --from-scratch --yes
+./scripts/setup.sh deploy --from-scratch --yes
+./scripts/setup.sh verify --full
+./scripts/setup.sh workload proof all
 ```
 
-Part 1 runs `nuke`, `preflight`, `init`, `validate`, the phase-1 Terraform deployment, the Bastion tunnel and Bastion-backed kubeconfig handoff, and the phase-2 Terraform deployment. It then stops on purpose and writes the exact handoff to `.cache/aks-anyscale-sample-harness/deploy-e2e.pause.txt` so you can do the one remaining manual step. If you rerun part 1 against an environment where the target AKS cluster already exists, it skips the destructive phase-1 toggle apply and just reconciles phase 2 before stopping again at the handoff.
+`deploy --from-scratch --yes` force-deletes the configured resource group if it exists, clears local Terraform state artifacts, runs static Terraform validation, creates the Azure foundation, opens Bastion-backed private AKS access, applies the Kubernetes bootstrap and Azure-native Anyscale resources, installs the AKS extension, registers `aks-cpu` and `aks-gpu`, creates or reuses `aks-cpu-workspace` and `aks-gpu-workspace`, starts both workspaces, and checks warm CPU/GPU workers on the expected AKS node pools.
 
-This is the required workaround for the current Anyscale auth gap: let the script provision everything it can, stop after phase 2, add `ANYSCALE_CLI_TOKEN` to `.env` from the Anyscale console, then continue with part 2.
+Plain `deploy` is the idempotent reconciliation command to rerun after changes. It skips the initial cleanup, reuses the target AKS cluster when it already exists, and reconciles the platform and workspace stages.
 
-At the pause point, update only `ANYSCALE_CLI_TOKEN` in `.env` and then run:
+Each run writes console progress and per-stage logs under `.cache/aks-anyscale-sample-harness/runs/<timestamp>-<command>/`, with a `summary.md` and `stages.tsv` for easy inspection.
+
+`verify --full` runs the static Terraform checks and then the live health/focused validation path through Bastion. Use `verify --static` for local configuration checks only, or `verify --live --skip-observability` when Log Analytics ingestion is not ready yet.
+
+`workload proof all` pushes deterministic Ray scripts from `workloads/proofs/` into the durable CPU and GPU workspaces and executes them there. The CPU proof computes squares for rows `0..15` and must print `CPU_RAY_PROOF_OK`; the GPU proof requires a Ray task with `num_gpus=1`, verifies `CUDA_VISIBLE_DEVICES`, computes cubes for rows `0..7`, and must print `GPU_RAY_PROOF_OK`. The command collects Anyscale workspace logs plus AKS pod, operator, container, and event diagnostics into the run directory.
+
+For repeatability testing, use the non-destructive harness:
 
 ```bash
-./scripts/setup.sh deploy-part2
+./scripts/validate-idempotency.sh
 ```
 
-Part 2 reuses or restarts the Bastion tunnel, reruns `terraform init` and the repository validation checks, exports a Bastion-backed kubeconfig, reapplies the phase-2 Terraform configuration, patches the live `anyscale-operator` release, and runs `anyscale-workspaces-register` to create or reuse the durable CPU and GPU workspaces. When it finishes, it prints that you are ready to go with a workspace that has CPU and GPU configs ready.
-
-In practice, once part 1 has established the environment and you have supplied `ANYSCALE_CLI_TOKEN`, `./scripts/setup.sh deploy-part2` is the command you can keep rerunning after changes. That is the supported idempotent path for reconciling phase-2 infrastructure plus the Anyscale operator and workspace state.
-
-The older `./scripts/setup.sh deploy-e2e --from-scratch --yes` plus `./scripts/setup.sh deploy-e2e --resume` flow still works as a compatibility wrapper, but `deploy-part1` and `deploy-part2` are now the primary operator path.
-
-## Phase 1: build the Azure foundation and private AKS cluster
-
-Start by validating the workstation and the Terraform inputs, then run a phase-1 plan and apply with the Kubernetes bootstrap layer and Anyscale platform deployment disabled.
-
-```bash
-source .env
-az login --tenant "$TF_VAR_azure_tenant_id"
-
-./scripts/setup.sh preflight
-./scripts/setup.sh init
-./scripts/setup.sh validate
-
-export TF_VAR_cluster_bootstrap='{"enabled":false}'
-export TF_VAR_anyscale_platform='{"enabled":false}'
-
-./scripts/setup.sh plan
-./scripts/setup.sh apply
-./scripts/setup.sh outputs
-```
-
-`preflight` checks the required CLI tools, renders `terraform.auto.tfvars.json`, verifies `az login`, and switches Azure CLI to the subscription named in `.env`. `init` performs `terraform init`. `validate` runs `terraform fmt -check`, `terraform validate`, and the plan-time Terraform tests that assert the private-cluster, identity, firewall, DNS, observability, and native-extension contracts. The phase-1 `plan` and `apply` then create the Azure side of the deployment without attempting the Bastion-backed bootstrap, the Anyscale cloud deployment, or the marketplace extension install.
-
-When phase 1 completes successfully, you should have a live resource group, private AKS cluster, Bastion host, Azure Firewall, DNS resolver, private storage and registry, operator identity, and observability resources. What you do not have yet is the Kubernetes bootstrap layer inside the cluster, the Anyscale cloud deployment, or the AKS marketplace extension install, because all three belong to phase 2.
-
-## Phase 2: connect through Bastion and finish the deployment
-
-Phase 2 starts by opening a reusable Bastion tunnel, exporting a Bastion-backed kubeconfig, and then re-running Terraform with `cluster_bootstrap.kubeconfig_path` pointed at that kubeconfig. That is the handoff that lets the Terraform Kubernetes and Helm providers work against a private cluster from a local machine.
-
-```bash
-./scripts/setup.sh bastion-tunnel start
-eval "$(./scripts/setup.sh kubeconfig-bastion --export)"
-
-unset TF_VAR_anyscale_platform
-export TF_VAR_cluster_bootstrap="{\"kubeconfig_path\":\"${KUBECONFIG}\"}"
-
-./scripts/setup.sh plan
-./scripts/setup.sh apply
-./scripts/setup.sh outputs
-./scripts/setup.sh status
-```
-
-The Bastion helper writes the reusable tunnel state, kubeconfigs, and logs under `.cache/`, which is intentionally ignored by Git. `kubeconfig-bastion` fetches the normal AKS credentials, rewrites the kubeconfig server to the local Bastion listener, preserves the original TLS server name, and prints the `export KUBECONFIG=...` line that `eval` applies to the current shell.
-
-During phase 2, `plan` and `apply` also reconcile marketplace and platform state. If the Anyscale marketplace agreement or the Azure deployment already exists outside Terraform state, the wrapper imports them before continuing. When the apply succeeds, the wrapper also syncs `ANYSCALE_CLOUD_NAME` and `ANYSCALE_CLOUD_DEPLOYMENT_ID` back into `.env` so later Anyscale CLI commands can use the deployed cloud metadata without manual copy and paste.
-
-If the current shell already has a Bastion-backed kubeconfig, `ANYSCALE_CLI_TOKEN`, `.venv/bin/anyscale`, `kubectl`, `kubelogin`, `helm`, and `jq`, the phase-2 `apply` automatically runs `./scripts/setup.sh anyscale-workspace-ready` as the final step. If any of those prerequisites are missing, the apply still succeeds, but you need to run the post-configuration step yourself later from a Bastion-backed shell.
-
-The guided `deploy-part1` and `deploy-part2` wrappers use these same phase-2 mechanics. The difference is that they turn the missing-token case into an intentional part-1 stop and a dead-simple part-2 continuation instead of leaving the operator to reconstruct the remaining steps by hand. `deploy-part2` is also the recommended idempotent rerun path after later phase-2 or post-config changes.
+By default it runs deploy, verify, and workload proof twice, then requires a Terraform no-op plan. Destructive cleanup is opt-in with `--include-teardown` or `--include-force-teardown --i-understand-this-deletes-azure-resources`.
 
 ## How private AKS access works in this repository
 
 This repository assumes local operator access is Bastion-first. The direct `az aks get-credentials` path is not enough because the downloaded kubeconfig points at the private AKS API hostname. Without Bastion, the local machine has no route to that endpoint.
 
-If you want the shortest interactive shell path, start the preview-backed Bastion shell and fetch kubeconfig from inside it:
+The setup orchestrator owns that private access path. `deploy`, `verify --live`, and `workload proof ...` start or reuse the Bastion tunnel, write a Bastion-backed kubeconfig under `.cache/`, and point Terraform, `kubectl`, `helm`, and diagnostics at the local listener. The helper state lives under `.cache/aks-anyscale-sample-harness/`, which is ignored by Git.
+
+The browser path for private Anyscale workspaces is intentionally not part of the supported four-command UX. During validation, direct Ray Dashboard forwarding worked as a troubleshooting fallback, while the Anyscale browser auth path remained blocked by an upstream `400 Invalid host: login.microsoftonline.com` response after the Microsoft Entra callback. Keep browser experiments in local notes and support artifacts rather than in the primary deployment workflow.
+
+## Workspaces and workload proof
+
+`deploy` owns the Anyscale operator reconciliation and the durable workspace registration. It ensures the AKS-compatible declarative compute configs `aks-cpu` and `aks-gpu` exist, then creates or reuses `aks-cpu-workspace` and `aks-gpu-workspace`. Each worker group uses `required_resources` plus AKS node selectors and tolerations so the scheduler places CPU workers on `aks-cpu-*` nodes and GPU workers on `aks-gput4-*` nodes.
+
+Existing compute configs and workspaces with the same names are reused, so `deploy` is safe to rerun. If a sample workspace points at an older compute-config version, the orchestrator terminates it, updates the compute config, starts it again, waits for `RUNNING`, and validates that a warm worker is online on the expected AKS pool. Generated compute-config YAML and workspace logs are written under `.cache/` and the active run directory.
+
+After deployment, run the deterministic workload proof:
 
 ```bash
-./scripts/setup.sh bastion
-./scripts/setup.sh kubeconfig
-kubectl get nodes -o wide
+./scripts/setup.sh workload proof all
 ```
 
-Run the second and third commands inside the Bastion-backed shell. Use `./scripts/setup.sh bastion --admin` only for break-glass admin access.
+Use `workload proof cpu` or `workload proof gpu` when you only need one side. The proof command starts or reuses the target workspace, pushes the scripts under `workloads/proofs/`, runs them in the workspace through the Anyscale CLI, checks the expected success marker, and collects diagnostics under `.cache/aks-anyscale-sample-harness/runs/<timestamp>-workload-*/diagnostics/`.
 
-If you want the shortest local port-forwarded path from this machine, start the reusable tunnel and export the Bastion-backed kubeconfig into the current shell:
+The generated diagnostics include Anyscale workspace log tails and downloadable workspace logs when available, plus AKS workspace pod listings, pod descriptions, operator logs, workspace container logs, and namespace events. That gives first-run failures enough context to debug either the Anyscale layer or the Kubernetes scheduling/runtime layer.
 
-```bash
-./scripts/setup.sh bastion-tunnel start
-eval "$(./scripts/setup.sh kubeconfig-bastion --export)"
-kubectl get nodes -o wide
-```
-
-This is the path the repo uses for local `kubectl`, `helm`, `./scripts/setup.sh anyscale-workspace-ready`, `./scripts/setup.sh anyscale-workspaces-register`, `./scripts/setup.sh validate-focused`, and `./scripts/setup.sh validate-k8s`. `./scripts/setup.sh bastion-tunnel status` tells you whether the local listener is already running, `./scripts/setup.sh bastion-tunnel stop` shuts it down, and `./scripts/setup.sh kubeconfig-bastion --admin --export` is the break-glass admin variant.
-
-## Reach a private workspace from a local browser
-
-The Bastion tunnel only solves local access to the private AKS API. It does not make the private Anyscale session hostnames resolvable or reachable from a browser on this machine by itself. The temporary workaround in this repository now uses a separate Firefox profile plus a Firefox-only local PAC/proxy path, which avoids touching `/etc/hosts` and avoids affecting other Edge or Chrome instances on the Mac.
-
-On this machine, Firefox is available at `/Volumes/External SSD/Apps/Firefox.app`, and `workspace-browser-open` launches that Firefox binary with a disposable profile under `.cache/aks-anyscale-sample-harness/workspace-browser-profile`.
-
-The shortest browser-path command is the wrapper below, which starts or reuses the Bastion tunnel, writes a Bastion-backed kubeconfig, starts the local ingress tunnel, starts a tiny local proxy that only the temporary Firefox profile uses, and launches that disposable Firefox profile:
-
-```bash
-./scripts/setup.sh workspace-browser-open --session-id ses_xxx
-```
-
-By default, `workspace-browser-open` uses Bastion port `64435`, forwards `ingress-nginx-controller` to `127.0.0.1:18081` and `127.0.0.1:18443`, and starts a Firefox-only proxy on `127.0.0.1:18777` with a generated PAC file at `.cache/aks-anyscale-sample-harness/workspace-browser-proxy.pac`. Only the disposable Firefox profile uses that proxy path. Firefox is launched into `https://console.azure.anyscale.com/cluster_auth/<session>?relay_state=...` with an explicit relay state that points back to `https://session-<id>.i.azure.anyscaleuserdata.com/`, so the auth flow does not depend on the session page's hidden auto-submit behavior.
-
-At the time of writing, that browser path is still blocked by an Anyscale-side auth failure after the Microsoft Entra callback. The local Firefox/PAC workaround does reach the auth gateway correctly, but `console.azure.anyscale.com/api/v2/authentication/<session>/cluster` is currently returning `400 Invalid host: login.microsoftonline.com for cluster: <session>` instead of minting cluster-scoped credentials. Keep `workspace-browser-open` for reproducing the issue or collecting fresh HARs, not as the primary way to get into a running private session.
-
-For a live session, the expected probe pattern is `308` on HTTP and `401` on HTTPS before you authenticate, which proves that host-based routing and the auth gateway are reachable locally even though the cluster itself stays private.
-
-If you need non-default ports, you can override them explicitly:
-
-```bash
-./scripts/setup.sh workspace-browser-open --session-id ses_xxx --browser firefox --bastion-port 64435 --http-port 18081 --https-port 18443
-```
-
-When you no longer need the temporary browser and network path, stop them with:
-
-```bash
-./scripts/setup.sh workspace-browser-open stop
-```
-
-If you only want to close the separate browser profile and keep the Bastion/browser tunnel running, use:
-
-```bash
-./scripts/setup.sh workspace-browser-open stop --keep-network
-```
-
-The browser launcher reuses the network wrapper below under the hood. If you prefer to manage the network path yourself, this command starts or reuses the Bastion tunnel, writes the Bastion-backed kubeconfig, and starts the local ingress tunnel without launching a browser:
-
-```bash
-./scripts/setup.sh workspace-browser-ready --session-id ses_xxx
-```
-
-That network-only wrapper is equivalent to the manual three-command sequence below:
-
-```bash
-./scripts/setup.sh bastion-tunnel start --port 64435
-eval "$(./scripts/setup.sh kubeconfig-bastion --export)"
-./scripts/setup.sh workspace-browser-tunnel start --session-id ses_xxx
-```
-
-If you use `anyscale cluster network_debug` from this Mac, be aware that the private `session-*.i.azure.anyscaleuserdata.com` hostname will not resolve locally without the workaround above, and local `HTTP_PROXY` or `HTTPS_PROXY` settings can add a second proxy-related failure on top of the real private-DNS miss.
-
-For practical local access while `cluster_auth` is broken, use the direct head-service forward instead:
-
-```bash
-./scripts/setup.sh workspace-head-forward --session-id ses_xxx
-```
-
-That command starts or reuses the Bastion tunnel, exports the Bastion-backed kubeconfig, and port-forwards the live `ses-...-head` service directly to localhost. By default it exposes the Ray Dashboard on `http://127.0.0.1:18265/` and also forwards the session service HTTP port to `http://127.0.0.1:18080/`.
-
-In the current environment, `http://127.0.0.1:18265/` is the usable fallback because it returns the Ray Dashboard directly, while `http://127.0.0.1:18080/` still sits behind the Anyscale auth gate and returns `401 Unauthorized` until the upstream auth bug is fixed.
-
-If you want the same disposable Firefox flow but pointed at the working Ray Dashboard fallback instead of `cluster_auth`, use:
-
-```bash
-./scripts/setup.sh workspace-head-open --session-id ses_xxx
-```
-
-That command reuses the managed head-service forward and launches the temporary Firefox profile directly to `http://127.0.0.1:18265/`, so you do not need to copy the local URL by hand.
-
-You can inspect or stop that managed forward with:
-
-```bash
-./scripts/setup.sh workspace-head-forward status
-./scripts/setup.sh workspace-head-forward stop
-```
-
-To close only the temporary Firefox profile but keep the direct forward running, use:
-
-```bash
-./scripts/setup.sh workspace-head-open stop --keep-forward
-```
-
-## Patch the Anyscale operator and register the CPU and GPU workspaces
-
-If phase 2 did not auto-run the operator patch, start from a shell that already has Bastion-backed access and run the helper directly.
-
-```bash
-eval "$(./scripts/setup.sh kubeconfig-bastion --export)"
-./scripts/setup.sh anyscale-workspace-ready
-```
-
-That command validates the repo-local Anyscale CLI against `ANYSCALE_HOST`, discovers the installed `anyscale-operator` Helm release and chart version, builds an AKS-specific values overlay, upgrades the live release in place, verifies that the expected CPU and GPU instance types appear in the `instance-types` ConfigMap, and checks the operator patch ConfigMap for the AKS GPU toleration changes. The generated overlay is written to `.cache/anyscale-operator.workspace-ready.values.yaml` so you can inspect exactly what the helper applied.
-
-Once the operator patch is in place, register the dedicated CPU and GPU workspaces with a single command.
-
-```bash
-./scripts/setup.sh anyscale-workspaces-register
-```
-
-`anyscale-workspaces-register` is idempotent. It re-runs `anyscale-workspace-ready`, ensures the AKS-compatible **declarative** compute configs `aks-cpu` (head `CPU: 8 / memory: 32Gi` on `agentpool: cpu`, worker `cpu-workers` → same shape, 1–1 nodes) and `aks-gpu` (CPU head on `agentpool: cpu`, worker `gpu-workers` → `CPU: 8 / GPU: 1 / memory: 32Gi` on `agentpool: gput4`, 1–1 nodes) exist, then registers two workspaces against those configs. Each worker group uses `required_resources` instead of named instance types, so the operator dynamically generates pod shapes and the AKS scheduler places them on the matching node pool via the embedded `advanced_instance_config.spec.nodeSelector`/`tolerations`. The command refreshes any stale compute-config versions that still reference legacy named instance types or the older scale-from-zero worker settings, updates the sample workspaces to the latest compute-config version, starts both workspaces, and validates that their warm workers are online on the expected AKS pools:
-
-- `aks-cpu-workspace` — started automatically, waited until `RUNNING`, confirmed that the Ray head pod was scheduled on an `aks-cpu-*` node, and confirmed that a warm `cpu-workers` pod was running on the CPU pool.
-- `aks-gpu-workspace` — started automatically, waited until `RUNNING`, confirmed that the Ray head pod was scheduled on an `aks-cpu-*` node, and confirmed that a warm `gpu-workers` pod was running on an `aks-gput4-*` node.
-
-Existing compute configs and workspaces with the same names are reused, so this command is safe to re-run. When the generated compute-config version changes, the helper reconciles the sample workspaces to that newer version before starting them again. Generated compute-config YAML and command logs are written under `.cache/` (for example `.cache/anyscale-compute.aks-cpu.yaml`, `.cache/aks-cpu-workspace.validate.log`, `.cache/aks-gpu-workspace.validate.log`, `.cache/aks-gpu-workspace.start.log`).
-
-If the Anyscale console **Create** flow fails on this manually registered AKS cloud with `Failed to find compute config template for AZURE`, that is not a missing `deploy-part2` step in this repository. The backend workspace-create path is healthy; the same cloud accepts `workspace_v2 create` calls against the registered `aks-cpu` and `aks-gpu` compute configs. Use the repo wrapper below as the supported workaround for creating additional workspaces:
-
-```bash
-./scripts/setup.sh anyscale-workspace-create --name my-cpu-workspace --compute-config aks-cpu
-./scripts/setup.sh anyscale-workspace-create --name my-gpu-workspace --compute-config aks-gpu --start
-```
-
-The helper reuses an existing workspace name if it is already present, fails fast if the named compute config does not exist yet, and writes the create/start logs under `.cache/`.
-
-### Run a bounded CLI runtime proof
-
-Before the manual console proof, you can run the runtime checks from the local Bastion-backed shell. These commands are intentionally split into small steps and the wait step uses a maximum attempt count so it cannot poll forever.
-
-```bash
-eval "$(./scripts/setup.sh kubeconfig-bastion --export)"
-
-./scripts/setup.sh anyscale-workspaces-runtime-proof start-gpu
-./scripts/setup.sh anyscale-workspaces-runtime-proof wait-gpu --max-attempts 30 --interval-seconds 30
-./scripts/setup.sh anyscale-workspaces-runtime-proof gpu-probe
-```
-
-`start-gpu` starts `aks-gpu-workspace` and treats an already `STARTING` or `RUNNING` workspace as success. `wait-gpu` polls `anyscale workspace_v2 status` until the workspace reaches `RUNNING`, fails fast on terminal failure states, and stops after the configured attempt budget. `gpu-probe` confirms the GPU workspace head is reachable, runs `nvidia-smi -L`, and then runs a Ray task with `num_gpus=1` that must emit `GPU_WORKSPACE_OK` from a worker scheduled on an `aks-gput4-*` node.
-
-For convenience, `./scripts/setup.sh anyscale-workspaces-runtime-proof all` runs those three GPU steps in order. The bounded CPU proof remains available as a separate command when you want to re-check on-cluster CPU execution explicitly:
-
-```bash
-./scripts/setup.sh anyscale-workspaces-runtime-proof cpu-probe --command-timeout-seconds 600
-```
-
-Generated logs are written under `.cache/`, including `.cache/aks-gpu-workspace.runtime.wait.log`, `.cache/aks-gpu-workspace.nvidia-smi.log`, `.cache/aks-gpu-workspace.ray-gpu.log`, and `.cache/aks-cpu-workspace.ray-cpu.log`.
-
-If you already created `aks-gpu-workspace` before the compute config was refreshed from the custom `8CPU-32GB-1xT4-AKS` type to the built-in `8CPU-32GB-1xT4` type, the old workspace may be stuck in `ERRORED` and Anyscale will not allow updating its compute config until it reaches `TERMINATED`. In that case, create a clean replacement workspace and point the proof commands at it:
-
-```bash
-./scripts/setup.sh anyscale-workspaces-register --gpu-workspace-name aks-gpu-workspace-v2
-./scripts/setup.sh anyscale-workspaces-runtime-proof start-gpu --gpu-workspace-name aks-gpu-workspace-v2
-./scripts/setup.sh anyscale-workspaces-runtime-proof wait-gpu --gpu-workspace-name aks-gpu-workspace-v2 --max-attempts 30 --interval-seconds 30
-./scripts/setup.sh anyscale-workspaces-runtime-proof gpu-probe --gpu-workspace-name aks-gpu-workspace-v2
-```
-
-### Manually validate the GPU workspace from the Anyscale console
-
-After `anyscale-workspaces-register` completes, run the GPU proof by hand. This avoids the long `STARTING → RUNNING` wait on every script run and lets you exercise the console flow the way an Anyscale user would.
-
-1. Open the Anyscale console at `https://console.azure.anyscale.com`, switch to the cloud whose name matches `ANYSCALE_CLOUD_NAME` from `.env`, and confirm that both compute configs `aks-cpu` and `aks-gpu` are listed and active.
-2. Open the **Workspaces** view and confirm that both `aks-cpu-workspace` and `aks-gpu-workspace` are `RUNNING` after `anyscale-workspaces-register` completes.
-3. Open `aks-cpu-workspace` and run a small Ray CPU task in a notebook or terminal, for example:
-
-   ```python
-   import ray
-   ray.init(address="auto")
-
-   @ray.remote(num_cpus=1)
-   def probe():
-       return "CPU_WORKSPACE_OK"
-
-   print(ray.get(probe.remote()))
-   ```
-
-   This complements the structural validation the script already ran and proves the CPU workspace is interactively usable.
-4. If you previously stopped `aks-gpu-workspace` to save cost, start it again and wait for it to return to `RUNNING`.
-5. Open a terminal in the GPU workspace and confirm GPU visibility:
-
-   ```bash
-   nvidia-smi -L
-   ```
-
-   You should see a single `Tesla T4` device. Then run a Ray GPU task:
-
-   ```python
-   import os
-   import ray
-   ray.init(address="auto")
-
-   @ray.remote(num_gpus=1)
-   def gpu_probe():
-       return os.environ.get("CUDA_VISIBLE_DEVICES", "none")
-
-   print(ray.get(gpu_probe.remote()))
-   ```
-
-   The task should return `0` (or another non-`none` device index), proving Ray scheduled a GPU-pinned task on the GPU node pool.
-6. From a Bastion-backed shell, confirm the workspace heads and workers are scheduled on the intended AKS pools:
-
-   ```bash
-   eval "$(./scripts/setup.sh kubeconfig-bastion --export)"
-   kubectl get pods -n anyscale-operator -l 'app.kubernetes.io/name in (aks-cpu-workspace,aks-gpu-workspace)' -o wide
-   ```
-
-   Both workspace head pods should run on `aks-cpu-*` nodes, the `aks-cpu-workspace` worker pod should run on an `aks-cpu-*` node, and the `aks-gpu-workspace` worker pod should run on an `aks-gput4-*` node.
-
-When you are done, you can stop `aks-gpu-workspace` from the Anyscale console if you want the GPU node pool to scale back down. `aks-cpu-workspace` is safe to leave running as the always-on CPU entrypoint.
+You can still use the Anyscale console for manual inspection. The expected end state is that `aks-cpu-workspace` and `aks-gpu-workspace` are `RUNNING`, `aks-cpu-workspace` can run Ray CPU tasks, and `aks-gpu-workspace` can run Ray tasks requiring `num_gpus=1` with `CUDA_VISIBLE_DEVICES` set.
 
 ## Validate the codebase and the deployed environment
 
-There are two kinds of validation in this repository. The first kind is the code and plan validation you should run before or during deployment. The second kind is the live cluster and platform validation you should run after phase 2 and the post-configuration steps have completed.
-
-For code and plan validation, `./scripts/setup.sh validate` is the standard wrapper path and `./scripts/validate-static.sh` is the non-deploying helper that writes a summary under `.cache/static-validation/<timestamp>/`. The dedicated apply test at `infra/terraform/tests/apply.tftest.hcl` is intentionally limited to the Azure phase-1 shape: it provisions the phase-1 resources, asserts the outputs and private-mode invariants, and destroys them automatically when the test ends.
+There are three validation levels in this repository. `verify --static` runs formatting, Terraform validation, and the plan-time Terraform tests. `verify --live` checks the deployed Azure, AKS, Anyscale operator, workspace, and focused Kubernetes path through Bastion. `verify --full` runs both.
 
 ```bash
-./scripts/setup.sh validate
-./scripts/validate-static.sh
+./scripts/setup.sh verify --static
+./scripts/setup.sh verify --live --skip-observability
+./scripts/setup.sh verify --full
+```
 
+The live path writes per-check logs plus a summary under the run directory. It verifies private AKS API reachability, Azure resource state, operator rollout, workspace readiness, private DNS and firewall-routed egress, Workload Identity storage access, internal ingress reachability, GPU scheduling, and observability when enabled.
+
+For a deeper Terraform-only apply test, run the native test directly from the Terraform root. It provisions the phase-1 resource shape, asserts outputs and private-mode invariants, and destroys those test resources when the test ends.
+
+```bash
 cd infra/terraform
 terraform test -filter=tests/apply.tftest.hcl -verbose
 ```
-
-After phase 2 and the Anyscale post-configuration steps are in place, run the live validation sequence from a shell that already has Bastion-backed access.
-
-```bash
-./scripts/setup.sh validate-focused
-./scripts/setup.sh validate-k8s
-./scripts/setup.sh validate-observability
-./scripts/setup.sh control-plane-egress-smoke
-```
-
-`validate-focused` is the fastest rerunnable proof set and writes per-check logs plus a summary under `.cache/focused-validation/<timestamp>/`. It verifies `kubectl` access, namespace preparation, private DNS and egress behavior, Workload Identity storage access, internal ingress reachability, GPU scheduling, and optionally observability. `validate-k8s` expands the Kubernetes checks, `functional-test` remains as a shorthand wrapper around that same Kubernetes validation path, `validate-observability` queries Log Analytics after ingestion catches up, and `control-plane-egress-smoke` confirms that in-cluster workloads can resolve and reach the Anyscale control-plane endpoints plus any additional FQDNs configured in `TF_VAR_anyscale_fqdns`.
 
 `./scripts/test-timeouts.sh` is also available when you want to validate the timeout wrapper itself without waiting on Azure, Bastion, or Terraform.
 
@@ -396,17 +139,15 @@ After phase 2 and the Anyscale post-configuration steps are in place, run the li
 This repository provisions its own AKS cluster today, but the same integration pattern can be used as the acceptance bar for a bring-your-own AKS variant. If you want to bring an existing AKS cluster with one CPU node pool and one GPU node pool into this Anyscale flow, the integration should only be considered successful when all of the following are true:
 
 - The target AKS cluster is reachable through the Bastion-backed access path and, in addition to whatever system pool AKS itself requires, exposes one schedulable CPU node pool and one schedulable GPU node pool with the expected selectors, taints, and NVIDIA device availability.
-- The phase-2 ARM and Terraform flow completes without manual portal repair work, and the Azure-native Anyscale cloud resource plus the `anyscaleoperator` AKS extension both reach `Succeeded`.
-- `./scripts/setup.sh anyscale-workspace-ready` succeeds, the live operator release accepts the token patch, and the resulting `instance-types` ConfigMap contains at least one CPU-only instance type and one GPU-backed instance type that map cleanly to the CPU and GPU pools.
-- `./scripts/setup.sh validate-focused`, `./scripts/setup.sh validate-k8s`, and `./scripts/setup.sh control-plane-egress-smoke` all pass, proving private API access, firewall-routed egress, Workload Identity storage access, internal ingress reachability, and GPU scheduling.
-- `./scripts/setup.sh anyscale-workspaces-register` succeeds: it registers the `aks-cpu` and `aks-gpu` compute configs, registers `aks-cpu-workspace` and `aks-gpu-workspace`, starts both workspaces, waits until they reach `RUNNING`, confirms both heads are on the CPU pool, and confirms warm CPU and GPU worker pods are online on the expected node pools.
-- A console session against `aks-cpu-workspace` runs a small Ray CPU task on the CPU pool using the CPU-only instance type.
-- After starting `aks-gpu-workspace` from the bounded CLI proof or the Anyscale console, a console session runs a small Ray GPU task on the GPU pool, with `nvidia-smi -L` reporting a `Tesla T4` and the Ray task returning a valid `CUDA_VISIBLE_DEVICES` value.
-- The end-to-end path is repeatable: re-running `./scripts/setup.sh anyscale-workspaces-register` reuses the existing compute configs and workspaces without recreating them, and the manual GPU validation can be repeated through the console without reworking the underlying AKS, Bastion, identity, or operator wiring by hand.
+- `./scripts/setup.sh deploy` completes without manual portal repair work, and the Azure-native Anyscale cloud resource plus the `anyscaleoperator` AKS extension both reach `Succeeded`.
+- `./scripts/setup.sh verify --full` passes, proving private API access, firewall-routed egress, Workload Identity storage access, internal ingress reachability, GPU scheduling, workspace readiness, and observability when enabled.
+- The deploy stage registers the `aks-cpu` and `aks-gpu` compute configs, registers `aks-cpu-workspace` and `aks-gpu-workspace`, starts both workspaces, waits until they reach `RUNNING`, and confirms warm CPU and GPU worker pods are online on the expected node pools.
+- `./scripts/setup.sh workload proof all` passes and emits both `CPU_RAY_PROOF_OK` and `GPU_RAY_PROOF_OK` from the durable workspaces.
+- The end-to-end path is repeatable: rerunning `deploy`, `verify --full`, and `workload proof all` reuses existing durable infrastructure and returns the same deterministic markers.
 
 ## Inspect the environment during and after deployment
 
-`./scripts/setup.sh outputs` prints the Terraform outputs. `./scripts/setup.sh status` gives you the read-only operator view of the environment: Terraform resource names, Anyscale cloud metadata, Azure AKS state, node pool state, enterprise DNS path, and, when the current shell already has Bastion-backed Kubernetes access, the live node list, Helm add-ons, and ingress service details. `./scripts/setup.sh health` is the bounded active-check wrapper when you want the script to verify Bastion access, Anyscale control-plane reachability, workspace registration, and the currently running workspace heads instead of only printing status. `./scripts/setup.sh post` is a shorter reminder of the Bastion-backed bootstrap and post-configuration workflow if you need a quick refresher from the command line.
+Every `deploy`, `verify`, `workload`, and `teardown` run writes a timestamped directory under `.cache/aks-anyscale-sample-harness/runs/`. Start with that run directory when you need to inspect state: `summary.md` gives the stage overview, `stages.tsv` is machine-readable, and `logs/` contains the raw command output for each stage. Workload runs also include a `diagnostics/` tree with Anyscale workspace logs, AKS pod descriptions, operator logs, container logs, and Kubernetes events.
 
 ## Operational tooling
 
@@ -472,11 +213,7 @@ During this validation session the extension installed cleanly and the command s
 
 ### Inspektor Gadget
 
-Inspektor Gadget adds live Kubernetes and kernel troubleshooting helpers such as process snapshots, DNS inspection, and network tracing. In this repository it was used through the Bastion-backed kubeconfig, so every cluster-facing command should start from a shell that already exported the private access path:
-
-```bash
-eval "$(./scripts/setup.sh kubeconfig-bastion --export)"
-```
+Inspektor Gadget adds live Kubernetes and kernel troubleshooting helpers such as process snapshots, DNS inspection, and network tracing. In this repository it was used through the Bastion-backed kubeconfig that the orchestrator writes under `.cache/` during live validation and workload proof runs.
 
 Install `krew` if needed, then install and deploy the gadget plugin:
 
@@ -489,22 +226,25 @@ In this environment the direct `kubectl-gadget` binary under `$HOME/.krew/bin/` 
 
 ## Tear the environment down
 
-Use `destroy` when you want Terraform to delete the deployed resources in the normal way.
+Use `teardown` when you want Terraform to delete the deployed resources in the normal way.
 
 ```bash
-./scripts/setup.sh destroy
+./scripts/setup.sh teardown
 ```
 
 The command asks you to type the project name from `.env` before it proceeds, stops any running Bastion tunnel, runs `terraform destroy`, and clears the cached Anyscale cloud deployment ID from `.env`.
 
-Use `nuke` when you need a full reset after a failed private-cluster experiment and want Azure CLI to delete the resource group directly before removing local Terraform state and saved plan files.
+When `anyscale_platform.enabled=true`, `terraform destroy` now includes a temporary pre-destroy Anyscale cleanup hook. The hook runs before the AKS extension, AKS cluster, and resource group are torn down, terminates workspaces in the current cloud, and then issues the Azure `Anyscale.Platform/clouds` delete while the backing resources still exist. This is an Azure-specific workaround for the current Anyscale backend delete blocker and can be removed later when the upstream delete path is fixed.
+
+If that hook cannot drain the current cloud, `terraform destroy` stops early on purpose so the AKS/operator resources are still present for inspection instead of leaving the cloud in the older wedged state. The default knobs are exposed under `anyscale_platform.destroy_workaround`, and the hook can be disabled explicitly with `TF_VAR_anyscale_platform='{"destroy_workaround":{"enabled":false}}'` if you intentionally need the previous behavior.
+
+Use the force path when you need a full reset after a failed private-cluster experiment and want Azure CLI to delete the resource group directly before removing local Terraform state and saved plan files.
 
 ```bash
-./scripts/setup.sh nuke
-./scripts/setup.sh nuke --yes
+./scripts/setup.sh teardown --force --yes
 ```
 
-`nuke` is intentionally stronger than `destroy`. It waits for the resource group deletion to finish, removes local Terraform state and plan files, keeps `.env` and `.terraform.lock.hcl`, and leaves you ready to run `./scripts/setup.sh init` before the next plan or apply.
+The force path is intentionally stronger than Terraform-backed teardown. It waits for the resource group deletion to finish, removes local Terraform state and plan files, keeps `.env` and `.terraform.lock.hcl`, and leaves you ready to run `./scripts/setup.sh deploy` again.
 
 ### Retire legacy Anyscale clouds on Azure
 

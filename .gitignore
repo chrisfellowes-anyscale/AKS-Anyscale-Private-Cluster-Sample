@@ -40,6 +40,11 @@ tfplan.*
 .vscode/*
 .venv/
 
+# Local AI agent skill bundles
+/.agents/skills/
+/.claude/
+/skills-lock.json
+
 # Local caches / generated artifacts
 .cache/
 tmp/
@@ -47,6 +52,8 @@ tmp/
 
 # Local working notes
 /ISSUES.md
+/ANYSCALE-DELETION-SUPPORT-REQUEST.md
+/E2E-VALIDATION-LOG.md
 
 # Misc
 /tmp
