@@ -9,9 +9,6 @@
 ###############################################################################
 
 variables {
-  azure_subscription_id = "24a4c592-bfaf-492f-beaf-f10b3b67f03f"
-  azure_tenant_id       = "6f070e41-8d1e-45c9-af17-551c9b98860d"
-
   project        = "tftest"
   environment    = "ci"
   azure_location = "westus3"

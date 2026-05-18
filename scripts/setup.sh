@@ -423,14 +423,6 @@ terraform_output_raw() {
   terraform output -raw "$1"
 }
 
-marketplace_agreement_resource_id() {
-  printf '/subscriptions/%s/providers/Microsoft.MarketplaceOrdering/agreements/%s/offers/%s/plans/%s\n' \
-    "${TF_VAR_azure_subscription_id}" \
-    "anyscale1750870039553" \
-    "anyscale-operator-aks" \
-    "anyscale-operator"
-}
-
 anyscale_platform_deployment_name() {
   printf 'dep-anyscale-%s-%s-%s\n' \
     "${TF_VAR_project}" \
@@ -457,25 +449,59 @@ anyscale_platform_enabled() {
   jq -e 'if type == "object" and has("enabled") then .enabled else true end' <<<"${TF_VAR_anyscale_platform}" >/dev/null 2>&1
 }
 
-ensure_anyscale_marketplace_agreement_state() {
-  local resource_address="azurerm_marketplace_agreement.anyscale_operator[0]"
-  local agreement_id
+ensure_anyscale_marketplace_agreement_accepted() {
+  # Marketplace agreements are subscription-scoped and survive resource-group
+  # teardowns, so they live outside Terraform state. Check current acceptance,
+  # skip silently if already accepted, otherwise prompt the user (or auto-accept
+  # when --yes was supplied) and call az to record acceptance.
+  local publisher="anyscale1750870039553"
+  local offer="anyscale-operator-aks"
+  local plan="anyscale-operator"
+  local terms_json accepted license_link privacy_link prompt_response
 
   anyscale_platform_enabled || return 0
 
-  agreement_id="$(marketplace_agreement_resource_id)"
+  terms_json="$(run_with_timeout "${SETUP_TIMEOUT_AZURE_COMMAND_SECONDS}" az vm image terms show \
+    --subscription "${TF_VAR_azure_subscription_id}" \
+    --publisher "${publisher}" \
+    --offer "${offer}" \
+    --plan "${plan}" \
+    --only-show-errors 2>/dev/null || true)"
 
-  if terraform state show "${resource_address}" >/dev/null 2>&1; then
-    return 0
+  if [[ -n "${terms_json}" ]]; then
+    accepted="$(jq -r '.accepted // false' <<<"${terms_json}" 2>/dev/null || echo "false")"
+    if [[ "${accepted}" == "true" ]]; then
+      return 0
+    fi
+    license_link="$(jq -r '.licenseTextLink // ""' <<<"${terms_json}" 2>/dev/null || echo "")"
+    privacy_link="$(jq -r '.privacyPolicyLink // ""' <<<"${terms_json}" 2>/dev/null || echo "")"
   fi
 
-  if run_with_timeout "${SETUP_TIMEOUT_AZURE_COMMAND_SECONDS}" az rest \
-    --method get \
-    --uri "https://management.azure.com${agreement_id}?api-version=2021-01-01" \
-    --only-show-errors >/dev/null 2>&1; then
-    log "Importing existing Anyscale marketplace agreement into Terraform state"
-    terraform import "${resource_address}" "${agreement_id}" >/dev/null
+  log "Anyscale operator marketplace agreement has not been accepted on subscription ${TF_VAR_azure_subscription_id}"
+  log "  Publisher: ${publisher}"
+  log "  Offer:     ${offer}"
+  log "  Plan:      ${plan}"
+  [[ -n "${license_link}" ]] && log "  Terms:     ${license_link}"
+  [[ -n "${privacy_link}" ]] && log "  Privacy:   ${privacy_link}"
+
+  if [[ "${DEPLOY_FORCE_YES:-false}" == true ]]; then
+    log "Auto-accepting marketplace agreement (--yes supplied)"
+  else
+    printf 'Accept the Anyscale marketplace agreement? [y/N]: '
+    IFS= read -r prompt_response || die "Marketplace agreement is required for the Anyscale operator AKS extension."
+    case "${prompt_response}" in
+      y|Y|yes|YES|Yes) ;;
+      *) die "Marketplace agreement not accepted; cannot install the Anyscale operator AKS extension. Re-run when ready to accept." ;;
+    esac
   fi
+
+  log "Recording marketplace agreement acceptance on subscription ${TF_VAR_azure_subscription_id}"
+  run_with_timeout "${SETUP_TIMEOUT_AZURE_COMMAND_SECONDS}" az vm image terms accept \
+    --subscription "${TF_VAR_azure_subscription_id}" \
+    --publisher "${publisher}" \
+    --offer "${offer}" \
+    --plan "${plan}" \
+    --only-show-errors >/dev/null
 }
 
 ensure_anyscale_platform_deployment_state() {
@@ -2498,7 +2524,7 @@ validate() {
 ###############################################################################
 plan() {
   render_tfvars
-  ensure_anyscale_marketplace_agreement_state
+  ensure_anyscale_marketplace_agreement_accepted
   ensure_anyscale_platform_deployment_state
   log "terraform plan -> tfplan"
   run_with_timeout "${SETUP_TIMEOUT_TERRAFORM_PLAN_SECONDS}" terraform plan -input=false -out=tfplan
@@ -2507,7 +2533,7 @@ plan() {
 ###############################################################################
 apply() {
   render_tfvars
-  ensure_anyscale_marketplace_agreement_state
+  ensure_anyscale_marketplace_agreement_accepted
   ensure_anyscale_platform_deployment_state
   if [[ ! -f tfplan ]]; then plan; fi
   log "terraform apply tfplan (this will take ~20 min - Azure Firewall + AKS)"
