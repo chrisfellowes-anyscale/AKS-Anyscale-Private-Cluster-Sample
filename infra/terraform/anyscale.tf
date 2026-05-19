@@ -37,13 +37,6 @@ locals {
   }
 }
 
-resource "azurerm_marketplace_agreement" "anyscale_operator" {
-  count = local.anyscale_platform_enabled ? 1 : 0
-
-  publisher = var.anyscale_platform.plan_publisher
-  offer     = var.anyscale_platform.plan_product
-  plan      = var.anyscale_platform.plan_name
-}
 
 # The Anyscale portal still exports the cloud resource path as an ARM template.
 # Keep that contract intact with AzAPI, but manage the AKS marketplace
@@ -173,7 +166,6 @@ resource "azurerm_kubernetes_cluster_extension" "anyscale_operator" {
 
   depends_on = [
     module.cluster_bootstrap,
-    azurerm_marketplace_agreement.anyscale_operator,
   ]
 }
 
