@@ -6,6 +6,7 @@
 #   ./scripts/setup.sh deploy [--from-scratch --yes]
 #   ./scripts/setup.sh verify [--static|--live|--full] [--skip-observability]
 #   ./scripts/setup.sh workload proof {cpu|gpu|all}
+#   ./scripts/setup.sh idempotency [--skip-workload] [--include-teardown|--include-force-teardown --i-understand-this-deletes-azure-resources]
 #   ./scripts/setup.sh teardown [--force] [--yes]
 ###############################################################################
 set -euo pipefail
@@ -28,6 +29,7 @@ HARNESS_DIR="${CACHE_DIR}/aks-anyscale-sample-harness"
 VALIDATION_REPORT_ROOT="${CACHE_DIR}/focused-validation"
 DEFAULT_BASTION_TUNNEL_PORT="64430"
 DEFAULT_ANYSCALE_HOST="https://console.azure.anyscale.com"
+ANYSCALE_CLOUD_TEARDOWN_SCRIPT="${ROOT_DIR}/scripts/lib/anyscale-cloud-teardown.sh"
 
 SETUP_TIMEOUT_TERRAFORM_INIT_SECONDS="${SETUP_TIMEOUT_TERRAFORM_INIT_SECONDS:-900}"
 SETUP_TIMEOUT_TERRAFORM_VALIDATE_SECONDS="${SETUP_TIMEOUT_TERRAFORM_VALIDATE_SECONDS:-600}"
@@ -5195,8 +5197,8 @@ force_teardown_drain_anyscale_cloud() {
   export ANYSCALE_CLOUD_ARM_ID="${cloud_arm_id}"
   export AZURE_SUBSCRIPTION_ID="${subscription_id}"
 
-  if [[ ! -x "${ROOT_DIR}/scripts/anyscale-destroy-workaround.sh" ]]; then
-    die "Missing executable Anyscale destroy workaround script."
+  if [[ ! -x "${ANYSCALE_CLOUD_TEARDOWN_SCRIPT}" ]]; then
+    die "Missing executable Anyscale cloud teardown helper."
   fi
 
   az account set --subscription "${subscription_id}" --only-show-errors
@@ -5209,7 +5211,7 @@ force_teardown_drain_anyscale_cloud() {
   SETUP_TIMEOUT_ANYSCALE_COMMAND_SECONDS="${SETUP_TIMEOUT_ANYSCALE_COMMAND_SECONDS}" \
     SETUP_TIMEOUT_AZURE_COMMAND_SECONDS="${SETUP_TIMEOUT_AZURE_COMMAND_SECONDS}" \
     run_with_timeout 2400 \
-      "${ROOT_DIR}/scripts/anyscale-destroy-workaround.sh" \
+      "${ANYSCALE_CLOUD_TEARDOWN_SCRIPT}" \
       --timeout-seconds 1800 \
       --poll-interval-seconds 20
 }
@@ -5305,9 +5307,9 @@ Usage:
   ./scripts/setup.sh teardown
   ./scripts/setup.sh teardown --force --yes
 
-Default teardown uses Terraform destroy, including the temporary Anyscale Azure
-cloud delete workaround. --force deletes the Azure resource group directly and
-purges local Terraform state artifacts.
+Default teardown uses Terraform destroy, including the Anyscale cloud teardown
+hook. --force deletes the Azure resource group directly and purges local
+Terraform state artifacts.
 USAGE
         return 0
         ;;
@@ -5335,23 +5337,234 @@ USAGE
   setup_run_summary
 }
 
+IDEMPOTENCY_RUN_DIR=""
+IDEMPOTENCY_LOG_DIR=""
+IDEMPOTENCY_SUMMARY_TSV=""
+IDEMPOTENCY_SUMMARY_MD=""
+IDEMPOTENCY_SUMMARY_JSON=""
+
+idempotency_write_summaries() {
+  {
+    printf '# Idempotency Validation Summary\n\n'
+    printf 'Run directory: `%s`\n\n' "${IDEMPOTENCY_RUN_DIR}"
+    printf '| Stage | Result | Duration | Log |\n'
+    printf '|---|---:|---:|---|\n'
+    tail -n +2 "${IDEMPOTENCY_SUMMARY_TSV}" | while IFS=$'\t' read -r stage_name stage_result duration_seconds log_file; do
+      printf '| `%s` | %s | %ss | `%s` |\n' "${stage_name}" "${stage_result}" "${duration_seconds}" "${log_file}"
+    done
+  } > "${IDEMPOTENCY_SUMMARY_MD}"
+
+  {
+    printf '{\n'
+    printf '  "run_dir": %s,\n' "$(printf '%s' "${IDEMPOTENCY_RUN_DIR}" | jq -R .)"
+    printf '  "stages": [\n'
+    local first_stage=true
+    while IFS=$'\t' read -r stage_name stage_result duration_seconds log_file; do
+      if [[ "${stage_name}" == "stage" ]]; then
+        continue
+      fi
+      if [[ "${first_stage}" == true ]]; then
+        first_stage=false
+      else
+        printf ',\n'
+      fi
+      printf '    {"stage": %s, "result": %s, "duration_seconds": %s, "log": %s}' \
+        "$(printf '%s' "${stage_name}" | jq -R .)" \
+        "$(printf '%s' "${stage_result}" | jq -R .)" \
+        "${duration_seconds}" \
+        "$(printf '%s' "${log_file}" | jq -R .)"
+    done < "${IDEMPOTENCY_SUMMARY_TSV}"
+    printf '\n  ]\n'
+    printf '}\n'
+  } > "${IDEMPOTENCY_SUMMARY_JSON}"
+}
+
+idempotency_run_stage() {
+  local stage_name="$1"
+  shift
+
+  local log_file start_epoch end_epoch duration_seconds exit_code
+  log_file="${IDEMPOTENCY_LOG_DIR}/${stage_name}.log"
+  start_epoch="$(date +%s)"
+  printf '[idempotency] %s started\n' "${stage_name}"
+
+  set +e
+  ( "$@" ) 2>&1 | tee "${log_file}"
+  exit_code=${PIPESTATUS[0]}
+  set -e
+
+  end_epoch="$(date +%s)"
+  duration_seconds=$((end_epoch - start_epoch))
+
+  if [[ "${exit_code}" -eq 0 ]]; then
+    printf '[idempotency] %s ok (%ss)\n' "${stage_name}" "${duration_seconds}"
+    printf '%s\tPASS\t%s\t%s\n' "${stage_name}" "${duration_seconds}" "${log_file}" >> "${IDEMPOTENCY_SUMMARY_TSV}"
+    return 0
+  fi
+
+  printf '[idempotency] %s failed (%ss). See %s\n' "${stage_name}" "${duration_seconds}" "${log_file}" >&2
+  printf '%s\tFAIL\t%s\t%s\n' "${stage_name}" "${duration_seconds}" "${log_file}" >> "${IDEMPOTENCY_SUMMARY_TSV}"
+  idempotency_write_summaries
+  return "${exit_code}"
+}
+
+idempotency_terraform_noop_plan() {
+  local cluster_bootstrap_json kubeconfig_path plan_exit
+
+  kubeconfig_path="${ROOT_DIR}/.cache/aks-anyscale-sample-harness/kubeconfig.bastion"
+  if [[ ! -f "${kubeconfig_path}" ]]; then
+    printf 'Missing Bastion-backed kubeconfig at %s. Run deploy before the no-op plan.\n' "${kubeconfig_path}" >&2
+    return 1
+  fi
+  if ! KUBECONFIG="${kubeconfig_path}" kubectl --request-timeout=15s get --raw=/readyz >/dev/null 2>&1; then
+    printf 'Bastion-backed kubeconfig at %s is not currently usable. Run deploy or verify --live to refresh it.\n' "${kubeconfig_path}" >&2
+    return 1
+  fi
+  export KUBECONFIG="${kubeconfig_path}"
+  export KUBE_CONFIG_PATH="${kubeconfig_path}"
+
+  cluster_bootstrap_json="${TF_VAR_cluster_bootstrap:-{}}"
+  if ! jq -e . >/dev/null 2>&1 <<<"${cluster_bootstrap_json}"; then
+    cluster_bootstrap_json="{}"
+  fi
+  export TF_VAR_cluster_bootstrap
+  TF_VAR_cluster_bootstrap="$(jq -cn \
+    --argjson cluster_bootstrap "${cluster_bootstrap_json}" \
+    --arg kubeconfig_path "${kubeconfig_path}" \
+    '$cluster_bootstrap + {kubeconfig_path: $kubeconfig_path}')"
+
+  pushd "${TERRAFORM_DIR}" >/dev/null
+  set +e
+  terraform plan \
+    -input=false \
+    -detailed-exitcode \
+    -var="cluster_bootstrap=${TF_VAR_cluster_bootstrap}" \
+    -out="${IDEMPOTENCY_RUN_DIR}/idempotency.tfplan"
+  plan_exit=$?
+  set -e
+  popd >/dev/null
+
+  case "${plan_exit}" in
+    0)
+      return 0
+      ;;
+    2)
+      printf 'Terraform reported a non-idempotent plan (detailed-exitcode=2).\n' >&2
+      return 2
+      ;;
+    *)
+      return "${plan_exit}"
+      ;;
+  esac
+}
+
+idempotency() {
+  local include_teardown=false
+  local include_force_teardown=false
+  local destructive_ack=false
+  local skip_workload=false
+  local setup_script="${ROOT_DIR}/scripts/setup.sh"
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --include-teardown)
+        include_teardown=true
+        shift
+        ;;
+      --include-force-teardown)
+        include_force_teardown=true
+        shift
+        ;;
+      --i-understand-this-deletes-azure-resources)
+        destructive_ack=true
+        shift
+        ;;
+      --skip-workload)
+        skip_workload=true
+        shift
+        ;;
+      --help|-h)
+        cat <<'USAGE'
+Usage:
+  ./scripts/setup.sh idempotency
+  ./scripts/setup.sh idempotency --skip-workload
+  ./scripts/setup.sh idempotency --include-teardown
+  ./scripts/setup.sh idempotency --include-force-teardown --i-understand-this-deletes-azure-resources
+
+Default mode is non-destructive: deploy twice, verify twice, workload proof all
+twice, then assert that Terraform has a no-op plan.
+USAGE
+        return 0
+        ;;
+      *)
+        die "Unknown idempotency option: $1"
+        ;;
+    esac
+  done
+
+  if [[ "${include_teardown}" == true && "${include_force_teardown}" == true ]]; then
+    die "Use either --include-teardown or --include-force-teardown, not both."
+  fi
+
+  if [[ "${include_force_teardown}" == true && "${destructive_ack}" != true ]]; then
+    die "Force teardown requires --i-understand-this-deletes-azure-resources."
+  fi
+
+  require_cmd jq
+  require_cmd kubectl
+
+  IDEMPOTENCY_RUN_DIR="${ROOT_DIR}/.cache/idempotency-validation/$(date -u +%Y%m%dT%H%M%SZ)"
+  IDEMPOTENCY_LOG_DIR="${IDEMPOTENCY_RUN_DIR}/logs"
+  IDEMPOTENCY_SUMMARY_TSV="${IDEMPOTENCY_RUN_DIR}/summary.tsv"
+  IDEMPOTENCY_SUMMARY_MD="${IDEMPOTENCY_RUN_DIR}/summary.md"
+  IDEMPOTENCY_SUMMARY_JSON="${IDEMPOTENCY_RUN_DIR}/summary.json"
+
+  mkdir -p "${IDEMPOTENCY_LOG_DIR}"
+  printf 'stage\tresult\tduration_seconds\tlog\n' > "${IDEMPOTENCY_SUMMARY_TSV}"
+
+  idempotency_run_stage "deploy-first" "${setup_script}" deploy
+  idempotency_run_stage "verify-first" "${setup_script}" verify --full
+  if [[ "${skip_workload}" != true ]]; then
+    idempotency_run_stage "workload-first" "${setup_script}" workload proof all
+  fi
+
+  idempotency_run_stage "deploy-second" "${setup_script}" deploy
+  idempotency_run_stage "verify-second" "${setup_script}" verify --full
+  if [[ "${skip_workload}" != true ]]; then
+    idempotency_run_stage "workload-second" "${setup_script}" workload proof all
+  fi
+
+  idempotency_run_stage "terraform-noop-plan" idempotency_terraform_noop_plan
+
+  if [[ "${include_teardown}" == true ]]; then
+    idempotency_run_stage "teardown" "${setup_script}" teardown
+  elif [[ "${include_force_teardown}" == true ]]; then
+    idempotency_run_stage "teardown-force" "${setup_script}" teardown --force --yes
+  fi
+
+  idempotency_write_summaries
+  printf '[idempotency] summary: %s\n' "${IDEMPOTENCY_SUMMARY_MD}"
+}
+
 ###############################################################################
 cmd="${1:-}"
 case "${cmd}" in
   ""|--help|-h)
     cat <<'USAGE'
-Usage: ./scripts/setup.sh {deploy|verify|workload|teardown}
+Usage: ./scripts/setup.sh {deploy|verify|workload|idempotency|teardown}
 
 Commands:
   deploy [--from-scratch --yes]
   verify [--static|--live|--full] [--skip-observability]
   workload proof {cpu|gpu|all}
+  idempotency [--skip-workload] [--include-teardown|--include-force-teardown --i-understand-this-deletes-azure-resources]
   teardown [--force] [--yes]
 USAGE
     ;;
   deploy) shift; deploy "$@" ;;
   verify) shift; verify "$@" ;;
   workload) shift; workload "$@" ;;
+  idempotency) shift; idempotency "$@" ;;
   teardown) shift; teardown "$@" ;;
-  *) die "Usage: $0 {deploy|verify|workload|teardown}" ;;
+  *) die "Usage: $0 {deploy|verify|workload|idempotency|teardown}" ;;
 esac

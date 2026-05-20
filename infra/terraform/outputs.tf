@@ -122,7 +122,7 @@ output "anyscale_extension_name" {
 }
 
 output "anyscale_platform_contract" {
-  description = "Plan-time contract for the Terraform-managed Anyscale marketplace extension configuration."
+  description = "Plan-time lifecycle contract for the Terraform-managed Anyscale cloud, AKS marketplace extension, and Azure cloud teardown hook."
   value = {
     enabled                          = local.anyscale_platform_enabled
     cloud_name                       = local.anyscale_platform_cloud_name
@@ -135,10 +135,17 @@ output "anyscale_platform_contract" {
     extension_release_train          = local.anyscale_platform_extension_release_train
     dynamic_configuration_keys       = local.anyscale_platform_extension_dynamic_configuration_keys
     extension_configuration_settings = local.anyscale_platform_extension_configuration_settings
-    destroy_workaround = {
+    lifecycle = {
+      create_order  = local.anyscale_platform_lifecycle_create_order
+      destroy_order = local.anyscale_platform_lifecycle_destroy_order
+    }
+    teardown = {
       enabled                               = local.anyscale_platform_destroy_workaround_enabled
       mode                                  = "terraform_data_local_exec"
-      workspace_termination_timeout_seconds = local.anyscale_platform_destroy_workaround_timeout_seconds
+      runtime_objects                       = local.anyscale_platform_destroy_workaround_runtime_objects
+      cloud_delete_stage                    = "before_extension_and_aks_destroy"
+      runtime_termination_timeout_seconds   = local.anyscale_platform_destroy_workaround_runtime_timeout_seconds
+      workspace_termination_timeout_seconds = local.anyscale_platform_destroy_workaround_runtime_timeout_seconds
       poll_interval_seconds                 = local.anyscale_platform_destroy_workaround_poll_interval_seconds
     }
   }
