@@ -360,10 +360,11 @@ variable "anyscale_platform" {
     extension natively with azurerm, wired to the existing AKS cluster,
     storage account, ACR, and operator UAMI.
 
-    destroy_workaround is a temporary Azure teardown hook. It runs before
-    Terraform destroys the Anyscale cloud, extension, and AKS dependencies so
-    the current cloud can be drained while its backing resources still exist.
-    Remove it after Anyscale fixes the backend-side delete blockers on Azure.
+    teardown is the established Azure cloud teardown hook. It terminates the
+    current cloud's jobs, services, workspaces, and backing cluster sessions,
+    then deletes the Anyscale cloud before Terraform tears down the AKS
+    extension and cluster. destroy_workaround remains accepted as a legacy
+    alias for compatibility.
   EOT
 
   type = object({
@@ -378,10 +379,17 @@ variable "anyscale_platform" {
     plan_product                     = optional(string, "anyscale-operator-aks")
     release_train                    = optional(string, "stable")
     tags_by_resource                 = optional(map(map(string)), {})
-    destroy_workaround = optional(object({
+    teardown = optional(object({
       enabled                               = optional(bool, true)
-      workspace_termination_timeout_seconds = optional(number, 900)
+      runtime_termination_timeout_seconds   = optional(number)
+      workspace_termination_timeout_seconds = optional(number)
       poll_interval_seconds                 = optional(number, 20)
+    }), {})
+    destroy_workaround = optional(object({
+      enabled                             = optional(bool, true)
+      runtime_termination_timeout_seconds = optional(number)
+      workspace_termination_timeout_seconds = optional(number)
+      poll_interval_seconds               = optional(number, 20)
     }), {})
   })
 
@@ -398,13 +406,22 @@ variable "anyscale_platform" {
   }
 
   validation {
-    condition     = try(var.anyscale_platform.destroy_workaround.workspace_termination_timeout_seconds, 900) >= 60
-    error_message = "anyscale_platform.destroy_workaround.workspace_termination_timeout_seconds must be at least 60 seconds."
+    condition = (
+      try(var.anyscale_platform.teardown.runtime_termination_timeout_seconds, null) == null ||
+      try(var.anyscale_platform.teardown.workspace_termination_timeout_seconds, null) == null ||
+      try(var.anyscale_platform.teardown.runtime_termination_timeout_seconds, null) == try(var.anyscale_platform.teardown.workspace_termination_timeout_seconds, null)
+    )
+    error_message = "anyscale_platform.teardown.runtime_termination_timeout_seconds and workspace_termination_timeout_seconds must match when both are set."
   }
 
   validation {
-    condition     = try(var.anyscale_platform.destroy_workaround.poll_interval_seconds, 20) >= 5
-    error_message = "anyscale_platform.destroy_workaround.poll_interval_seconds must be at least 5 seconds."
+    condition     = coalesce(try(var.anyscale_platform.teardown.runtime_termination_timeout_seconds, null), try(var.anyscale_platform.teardown.workspace_termination_timeout_seconds, null), try(var.anyscale_platform.destroy_workaround.runtime_termination_timeout_seconds, null), try(var.anyscale_platform.destroy_workaround.workspace_termination_timeout_seconds, null), 900) >= 60
+    error_message = "anyscale_platform.teardown.runtime_termination_timeout_seconds must be at least 60 seconds. workspace_termination_timeout_seconds and destroy_workaround remain supported as legacy aliases."
+  }
+
+  validation {
+    condition     = coalesce(try(var.anyscale_platform.teardown.poll_interval_seconds, null), try(var.anyscale_platform.destroy_workaround.poll_interval_seconds, null), 20) >= 5
+    error_message = "anyscale_platform.teardown.poll_interval_seconds must be at least 5 seconds. destroy_workaround remains supported as a legacy alias."
   }
 }
 

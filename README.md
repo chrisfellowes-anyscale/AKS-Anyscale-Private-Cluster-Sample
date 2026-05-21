@@ -69,6 +69,12 @@ The visible operator surface is intentionally small:
 ./scripts/setup.sh workload proof all
 ```
 
+For deployment, teardown, validation, workload proof, and repeatability,
+`scripts/setup.sh` is the primary shell entry point. The remaining top-level
+shell scripts are intentionally narrow: `scripts/test-timeouts.sh` is the
+timeout-library self-test, and `scripts/export-diagrams.sh` only regenerates
+documentation assets.
+
 `deploy --from-scratch --yes` force-deletes the configured resource group if it exists, clears local Terraform state artifacts, runs static Terraform validation, creates the Azure foundation, opens Bastion-backed private AKS access, applies the Kubernetes bootstrap and Azure-native Anyscale resources, installs the AKS extension, registers `aks-cpu` and `aks-gpu`, creates or reuses `aks-cpu-workspace` and `aks-gpu-workspace`, starts both workspaces, and checks warm CPU/GPU workers on the expected AKS node pools.
 
 Plain `deploy` is the idempotent reconciliation command to rerun after changes. It skips the initial cleanup, reuses the target AKS cluster when it already exists, and reconciles the platform and workspace stages.
@@ -79,10 +85,10 @@ Each run writes console progress and per-stage logs under `.cache/aks-anyscale-s
 
 `workload proof all` pushes deterministic Ray scripts from `workloads/proofs/` into the durable CPU and GPU workspaces and executes them there. The CPU proof computes squares for rows `0..15` and must print `CPU_RAY_PROOF_OK`; the GPU proof requires a Ray task with `num_gpus=1`, verifies `CUDA_VISIBLE_DEVICES`, computes cubes for rows `0..7`, and must print `GPU_RAY_PROOF_OK`. The command collects Anyscale workspace logs plus AKS pod, operator, container, and event diagnostics into the run directory.
 
-For repeatability testing, use the non-destructive harness:
+For repeatability testing, use the built-in idempotency harness:
 
 ```bash
-./scripts/validate-idempotency.sh
+./scripts/setup.sh idempotency
 ```
 
 By default it runs deploy, verify, and workload proof twice, then requires a Terraform no-op plan. Destructive cleanup is opt-in with `--include-teardown` or `--include-force-teardown --i-understand-this-deletes-azure-resources`.
@@ -263,9 +269,9 @@ Use `teardown` when you want Terraform to delete the deployed resources in the n
 
 The command asks you to type the project name from `.env` before it proceeds, stops any running Bastion tunnel, runs `terraform destroy`, and clears the cached Anyscale cloud deployment ID from `.env`.
 
-When `anyscale_platform.enabled=true`, `terraform destroy` now includes a temporary pre-destroy Anyscale cleanup hook. The hook runs before the AKS extension, AKS cluster, and resource group are torn down, terminates workspaces in the current cloud, and then issues the Azure `Anyscale.Platform/clouds` delete while the backing resources still exist. This is an Azure-specific workaround for the current Anyscale backend delete blocker and can be removed later when the upstream delete path is fixed.
+When `anyscale_platform.enabled=true`, `terraform destroy` includes a pre-destroy Anyscale cloud teardown hook. The hook runs before the AKS extension, AKS cluster, and resource group are torn down, terminates jobs, services, workspaces, and backing cluster sessions in the current cloud, and then issues the Azure `Anyscale.Platform/clouds` delete while the backing resources still exist.
 
-If that hook cannot drain the current cloud, `terraform destroy` stops early on purpose so the AKS/operator resources are still present for inspection instead of leaving the cloud in the older wedged state. The default knobs are exposed under `anyscale_platform.destroy_workaround`, and the hook can be disabled explicitly with `TF_VAR_anyscale_platform='{"destroy_workaround":{"enabled":false}}'` if you intentionally need the previous behavior.
+If that hook cannot drain the current cloud, `terraform destroy` stops early on purpose so the AKS/operator resources are still present for inspection instead of leaving the cloud in the older wedged state. The default knobs are exposed under `anyscale_platform.teardown`, and `destroy_workaround` remains accepted as a legacy input alias. The hook can be disabled explicitly with `TF_VAR_anyscale_platform='{"teardown":{"enabled":false}}'`.
 
 Use the force path when you need a full reset after a failed private-cluster experiment and want Azure CLI to delete the resource group directly before removing local Terraform state and saved plan files.
 

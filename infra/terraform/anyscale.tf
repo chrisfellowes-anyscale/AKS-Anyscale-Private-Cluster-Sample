@@ -5,9 +5,40 @@ locals {
   anyscale_platform_cloud_arm_id                             = "${azurerm_resource_group.this.id}/providers/Anyscale.Platform/clouds/${local.anyscale_platform_cloud_name}"
   anyscale_platform_extension_name                           = var.anyscale_platform.extension_resource_name
   anyscale_platform_extension_release_train                  = contains(["stable", "preview"], lower(var.anyscale_platform.release_train)) ? title(lower(var.anyscale_platform.release_train)) : var.anyscale_platform.release_train
-  anyscale_platform_destroy_workaround_enabled               = try(var.anyscale_platform.destroy_workaround.enabled, true)
-  anyscale_platform_destroy_workaround_timeout_seconds       = try(var.anyscale_platform.destroy_workaround.workspace_termination_timeout_seconds, 900)
-  anyscale_platform_destroy_workaround_poll_interval_seconds = try(var.anyscale_platform.destroy_workaround.poll_interval_seconds, 20)
+  anyscale_platform_destroy_workaround_enabled = coalesce(
+    try(var.anyscale_platform.teardown.enabled, null),
+    try(var.anyscale_platform.destroy_workaround.enabled, null),
+    true,
+  )
+  anyscale_platform_destroy_workaround_runtime_timeout_seconds = coalesce(
+    try(var.anyscale_platform.teardown.runtime_termination_timeout_seconds, null),
+    try(var.anyscale_platform.teardown.workspace_termination_timeout_seconds, null),
+    try(var.anyscale_platform.destroy_workaround.runtime_termination_timeout_seconds, null),
+    try(var.anyscale_platform.destroy_workaround.workspace_termination_timeout_seconds, null),
+    900,
+  )
+  anyscale_platform_destroy_workaround_poll_interval_seconds = coalesce(
+    try(var.anyscale_platform.teardown.poll_interval_seconds, null),
+    try(var.anyscale_platform.destroy_workaround.poll_interval_seconds, null),
+    20,
+  )
+  anyscale_platform_destroy_workaround_runtime_objects = [
+    "jobs",
+    "services",
+    "workspaces",
+    "cluster_sessions",
+  ]
+  anyscale_platform_lifecycle_create_order = [
+    "aks_cluster_and_bootstrap",
+    "anyscale_cloud",
+    "anyscale_extension",
+  ]
+  anyscale_platform_lifecycle_destroy_order = [
+    "drain_jobs_services_workspaces_and_cluster_sessions",
+    "delete_anyscale_cloud",
+    "delete_anyscale_extension",
+    "delete_aks_cluster",
+  ]
   anyscale_platform_extension_dynamic_configuration_keys = [
     "global.cloudDeploymentId",
     "global.controlPlaneURL",
@@ -164,14 +195,20 @@ resource "azurerm_kubernetes_cluster_extension" "anyscale_operator" {
     "global.auth.anyscaleCliToken" = var.anyscale_cli_token
   }
 
+  # Keep the cloud-to-extension edge explicit even though
+  # global.cloudDeploymentId already creates an implicit dependency. The
+  # teardown hook handles the non-inverse delete requirement by deleting the
+  # cloud before Terraform tears down the extension and AKS cluster.
   depends_on = [
+    azapi_resource.anyscale_platform,
     module.cluster_bootstrap,
   ]
 }
 
-# Temporary Azure destroy workaround: run the current-cloud drain before the
-# extension, cloud resource, and AKS dependencies are torn down. Remove this
-# resource and the helper script once Anyscale fixes backend delete handling.
+# Azure cloud teardown hook: while the cloud, extension, and AKS backing
+# resources still exist, drain Anyscale jobs, services, workspaces, and
+# cluster sessions, then delete the cloud before Terraform proceeds to the
+# extension and AKS teardown.
 resource "terraform_data" "anyscale_platform_destroy_workaround" {
   count = local.anyscale_platform_enabled && local.anyscale_platform_destroy_workaround_enabled ? 1 : 0
 
@@ -182,14 +219,14 @@ resource "terraform_data" "anyscale_platform_destroy_workaround" {
     anyscale_cloud_name   = local.anyscale_platform_cloud_control_plane_name
     anyscale_cloud_arm_id = local.anyscale_platform_cloud_arm_id
     azure_subscription_id = var.azure_subscription_id
-    timeout_seconds       = local.anyscale_platform_destroy_workaround_timeout_seconds
+    timeout_seconds       = local.anyscale_platform_destroy_workaround_runtime_timeout_seconds
     poll_interval_seconds = local.anyscale_platform_destroy_workaround_poll_interval_seconds
   }
 
   provisioner "local-exec" {
     when        = destroy
     working_dir = self.input.repo_root
-    command     = "./scripts/anyscale-destroy-workaround.sh --timeout-seconds ${self.input.timeout_seconds} --poll-interval-seconds ${self.input.poll_interval_seconds}"
+    command     = "./scripts/lib/anyscale-cloud-teardown.sh --timeout-seconds ${self.input.timeout_seconds} --poll-interval-seconds ${self.input.poll_interval_seconds}"
 
     environment = {
       ANYSCALE_HOST         = self.input.anyscale_host
@@ -203,5 +240,7 @@ resource "terraform_data" "anyscale_platform_destroy_workaround" {
   depends_on = [
     azapi_resource.anyscale_platform,
     azurerm_kubernetes_cluster_extension.anyscale_operator,
+    module.aks,
+    module.cluster_bootstrap,
   ]
 }

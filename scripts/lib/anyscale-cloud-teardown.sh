@@ -1,17 +1,17 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 ENV_FILE="${ROOT_DIR}/.env"
 CACHE_DIR="${ROOT_DIR}/.cache"
 
-LOG_INFO_PREFIX="anyscale-destroy-workaround"
-LOG_WARN_PREFIX="anyscale-destroy-workaround"
-LOG_ERROR_PREFIX="anyscale-destroy-workaround"
+LOG_INFO_PREFIX="anyscale-cloud-teardown"
+LOG_WARN_PREFIX="anyscale-cloud-teardown"
+LOG_ERROR_PREFIX="anyscale-cloud-teardown"
 
-# shellcheck source=./lib/log.sh
+# shellcheck source=./log.sh
 source "${ROOT_DIR}/scripts/lib/log.sh"
-# shellcheck source=./lib/timeout.sh
+# shellcheck source=./timeout.sh
 source "${ROOT_DIR}/scripts/lib/timeout.sh"
 
 DEFAULT_ANYSCALE_HOST="https://console.azure.anyscale.com"
@@ -23,12 +23,12 @@ SETUP_TIMEOUT_AZURE_COMMAND_SECONDS="${SETUP_TIMEOUT_AZURE_COMMAND_SECONDS:-180}
 usage() {
   cat <<'USAGE'
 Usage:
-  ./scripts/anyscale-destroy-workaround.sh [--timeout-seconds 900] [--poll-interval-seconds 20]
+  ./scripts/lib/anyscale-cloud-teardown.sh [--timeout-seconds 900] [--poll-interval-seconds 20]
 
-Temporary workaround for Azure-backed Anyscale cloud deletion. The script
-pauses the current cloud's schedules and terminates its jobs, services,
-workspaces, and cluster sessions before issuing the ARM delete for the
-Anyscale.Platform/clouds resource.
+Internal helper for the established Anyscale-on-Azure destroy flow. The script
+drains the current cloud's jobs, services, workspaces, and backing cluster
+sessions before issuing the ARM delete for the Anyscale.Platform/clouds
+resource.
 USAGE
 }
 
@@ -140,6 +140,32 @@ is_terminal_service_state() {
   esac
 }
 
+list_services_json() {
+  local cli_bin="$1"
+
+  run_with_timeout "${SETUP_TIMEOUT_ANYSCALE_COMMAND_SECONDS}" \
+    "${cli_bin}" service list \
+      --cloud "${ANYSCALE_CLOUD_NAME}" \
+      --include-archived \
+      -j \
+      --no-interactive \
+      --max-items 500
+}
+
+list_jobs_json() {
+  local cli_bin="$1"
+
+  run_with_timeout "${SETUP_TIMEOUT_ANYSCALE_COMMAND_SECONDS}" \
+    "${cli_bin}" job list \
+      --v2 \
+      --cloud "${ANYSCALE_CLOUD_NAME}" \
+      --include-all-users \
+      --include-archived \
+      -j \
+      --no-interactive \
+      --max-items 500
+}
+
 cloud_exists_in_arm() {
   run_with_timeout "${SETUP_TIMEOUT_AZURE_COMMAND_SECONDS}" \
     az resource show --ids "${ANYSCALE_CLOUD_ARM_ID}" --only-show-errors >/dev/null 2>&1
@@ -171,6 +197,68 @@ terminate_workspace() {
   fi
 
   warn "Workspace terminate request failed for ${workspace_name} (${workspace_id}); continuing to direct cluster termination and final state checks."
+  return 0
+}
+
+terminate_service() {
+  local cli_bin="$1"
+  local service_id="$2"
+  local service_name="$3"
+  local service_state="$4"
+  local terminate_log="$5"
+  local output
+
+  case "${service_state}" in
+    TERMINATED|SYSTEM_FAILURE)
+      return 0
+      ;;
+  esac
+
+  if output="$(run_with_timeout "${SETUP_TIMEOUT_ANYSCALE_COMMAND_SECONDS}" \
+    "${cli_bin}" service terminate --service-id "${service_id}" 2>&1)"; then
+    printf '%s\n' "${output}" >> "${terminate_log}"
+    log "Terminate requested for service ${service_name} (${service_id})"
+    return 0
+  fi
+
+  printf '%s\n' "${output}" >> "${terminate_log}"
+  if grep -Eiq 'already.*terminated|currently in state: TERMINATED|currently in state: TERMINATING' <<<"${output}"; then
+    warn "Service ${service_name} (${service_id}) was already terminating or terminated."
+    return 0
+  fi
+
+  warn "Service terminate request failed for ${service_name} (${service_id}); the final ARM delete will decide whether teardown can continue."
+  return 0
+}
+
+terminate_job() {
+  local cli_bin="$1"
+  local job_id="$2"
+  local job_name="$3"
+  local job_state="$4"
+  local terminate_log="$5"
+  local output
+
+  case "${job_state}" in
+    SUCCEEDED|FAILED|TERMINATED|ERRORED|BROKEN|OUT_OF_RETRIES|CANCELLED|CANCELED)
+      return 0
+      ;;
+  esac
+
+  if output="$(run_with_timeout "${SETUP_TIMEOUT_ANYSCALE_COMMAND_SECONDS}" \
+    "${cli_bin}" job terminate --id "${job_id}" --cloud "${ANYSCALE_CLOUD_NAME}" 2>&1)"; then
+    printf '%s\n' "${output}" >> "${terminate_log}"
+    log "Terminate requested for job ${job_name} (${job_id})"
+    return 0
+  fi
+
+  printf '%s\n' "${output}" >> "${terminate_log}"
+  if grep -Eiq 'already.*(terminated|failed|succeeded)|currently in state: (FAILED|SUCCEEDED|TERMINATED)' <<<"${output}"; then
+    warn "Job ${job_name} (${job_id}) was already in a terminal state."
+    return 0
+  fi
+
+  warn "Job terminate request failed for ${job_name} (${job_id}); the final ARM delete will decide whether teardown can continue."
   return 0
 }
 
@@ -214,98 +302,15 @@ PY
   warn "Direct cluster terminate request failed for ${cluster_id}; the final ARM delete will decide whether teardown can continue."
 }
 
-pause_schedule() {
-  local cli_bin="$1"
-  local schedule_id="$2"
-  local schedule_name="$3"
-  local pause_log="$4"
-  local output
-
-  if output="$(run_with_timeout "${SETUP_TIMEOUT_ANYSCALE_COMMAND_SECONDS}" \
-    "${cli_bin}" schedule pause --id "${schedule_id}" 2>&1)"; then
-    printf '%s\n' "${output}" >> "${pause_log}"
-    log "Pause requested for schedule ${schedule_name} (${schedule_id})"
-    return 0
-  fi
-
-  printf '%s\n' "${output}" >> "${pause_log}"
-  if grep -Eiq 'already.*paused|not.*active' <<<"${output}"; then
-    warn "Schedule ${schedule_name} (${schedule_id}) was already paused."
-    return 0
-  fi
-
-  warn "Schedule pause failed for ${schedule_name} (${schedule_id}); jobs from this schedule may briefly re-trigger before the cloud is deleted."
-  return 0
-}
-
-terminate_job() {
-  local cli_bin="$1"
-  local job_id="$2"
-  local job_name="$3"
-  local job_state="$4"
-  local terminate_log="$5"
-  local output
-
-  if is_terminal_job_state "${job_state}"; then
-    return 0
-  fi
-
-  if output="$(run_with_timeout "${SETUP_TIMEOUT_ANYSCALE_COMMAND_SECONDS}" \
-    "${cli_bin}" job terminate --id "${job_id}" 2>&1)"; then
-    printf '%s\n' "${output}" >> "${terminate_log}"
-    log "Terminate requested for job ${job_name} (${job_id})"
-    return 0
-  fi
-
-  printf '%s\n' "${output}" >> "${terminate_log}"
-  if grep -Eiq 'already.*terminat|currently in state: (SUCCEEDED|FAILED|TERMINATED)' <<<"${output}"; then
-    warn "Job ${job_name} (${job_id}) was already in a terminal state."
-    return 0
-  fi
-
-  warn "Job terminate request failed for ${job_name} (${job_id}); continuing to final state checks."
-  return 0
-}
-
-terminate_service() {
-  local cli_bin="$1"
-  local service_id="$2"
-  local service_name="$3"
-  local service_state="$4"
-  local terminate_log="$5"
-  local output
-
-  if is_terminal_service_state "${service_state}"; then
-    return 0
-  fi
-
-  if output="$(run_with_timeout "${SETUP_TIMEOUT_ANYSCALE_COMMAND_SECONDS}" \
-    "${cli_bin}" service terminate --id "${service_id}" 2>&1)"; then
-    printf '%s\n' "${output}" >> "${terminate_log}"
-    log "Terminate requested for service ${service_name} (${service_id})"
-    return 0
-  fi
-
-  printf '%s\n' "${output}" >> "${terminate_log}"
-  if grep -Eiq 'already.*terminat|currently in state: (TERMINATED|TERMINATING|SYSTEM_FAILURE)' <<<"${output}"; then
-    warn "Service ${service_name} (${service_id}) was already terminating or terminal."
-    return 0
-  fi
-
-  warn "Service terminate request failed for ${service_name} (${service_id}); continuing to final state checks."
-  return 0
-}
-
-wait_for_cloud_workloads_terminated() {
+wait_for_cloud_workloads_drained() {
   local cli_bin="$1"
   local cloud_id="$2"
-  local timeout_seconds="$3"
-  local poll_interval_seconds="$4"
-  local run_dir="$5"
-  local deadline current_epoch
-  local jobs_json services_json workspaces_json
-  local remaining_jobs remaining_services remaining_workspaces
-  local jobs_count services_count workspaces_count total
+  local cloud_name="$3"
+  local timeout_seconds="$4"
+  local poll_interval_seconds="$5"
+  local run_dir="$6"
+  local deadline current_epoch workspaces_json services_json jobs_json
+  local remaining_workspaces remaining_services remaining_jobs remaining_count summary
 
   deadline=$(( $(date +%s) + timeout_seconds ))
 
@@ -317,35 +322,33 @@ wait_for_cloud_workloads_terminated() {
     printf '%s\n' "${jobs_json}" > "${run_dir}/jobs.latest.json"
     printf '%s\n' "${services_json}" > "${run_dir}/services.latest.json"
     printf '%s\n' "${workspaces_json}" > "${run_dir}/workspaces.latest.json"
+    services_json="$(list_services_json "${cli_bin}")"
+    printf '%s\n' "${services_json}" > "${run_dir}/services.latest.json"
+    jobs_json="$(list_jobs_json "${cli_bin}")"
+    printf '%s\n' "${jobs_json}" > "${run_dir}/jobs.latest.json"
 
-    remaining_jobs="$(jq -c '[.[] | select((.state // "UNKNOWN") | test("^(SUCCEEDED|FAILED|TERMINATED)$") | not)]' <<<"${jobs_json}")"
-    remaining_services="$(jq -c '[.[] | select((.state // "UNKNOWN") | test("^(TERMINATED|SYSTEM_FAILURE)$") | not)]' <<<"${services_json}")"
-    remaining_workspaces="$(jq -c --arg cloud_id "${cloud_id}" '[.[] | select(.cloud_id == $cloud_id and .state != "TERMINATED")]' <<<"${workspaces_json}")"
+    remaining_workspaces="$(jq -c --arg cloud_id "${cloud_id}" '[.[] | select(.cloud_id == $cloud_id and (.state | ascii_upcase) != "TERMINATED")]' <<<"${workspaces_json}")"
+    remaining_services="$(jq -c '[.[] | select(((.current_state // .state // .status // "") | ascii_upcase) as $state | ($state != "TERMINATED" and $state != "SYSTEM_FAILURE"))]' <<<"${services_json}")"
+    remaining_jobs="$(jq -c '[.[] | select(((.state // .current_state // .status // "") | ascii_upcase) as $state | ($state != "SUCCEEDED" and $state != "FAILED" and $state != "TERMINATED" and $state != "ERRORED" and $state != "BROKEN" and $state != "OUT_OF_RETRIES" and $state != "CANCELLED" and $state != "CANCELED"))]' <<<"${jobs_json}")"
+    remaining_count="$(( $(jq 'length' <<<"${remaining_workspaces}") + $(jq 'length' <<<"${remaining_services}") + $(jq 'length' <<<"${remaining_jobs}") ))"
 
-    jobs_count="$(jq 'length' <<<"${remaining_jobs}")"
-    services_count="$(jq 'length' <<<"${remaining_services}")"
-    workspaces_count="$(jq 'length' <<<"${remaining_workspaces}")"
-    total=$(( jobs_count + services_count + workspaces_count ))
-
-    if (( total == 0 )); then
-      log "All current-cloud jobs, services, and workspaces reached a terminal state before ARM delete."
+    if [[ "${remaining_count}" == "0" ]]; then
+      log "All current-cloud jobs, services, and workspaces reached terminal states before ARM delete."
       return 0
     fi
 
-    {
-      printf 'jobs (%s remaining):\n' "${jobs_count}"
-      jq -r '.[] | "- \(.name // "?") (\(.id // "?")) state=\(.state // "?")"' <<<"${remaining_jobs}"
-      printf 'services (%s remaining):\n' "${services_count}"
-      jq -r '.[] | "- \(.name // "?") (\(.id // "?")) state=\(.state // "?")"' <<<"${remaining_services}"
-      printf 'workspaces (%s remaining):\n' "${workspaces_count}"
-      jq -r '.[] | "- \(.name // "?") (\(.id // "?")) state=\(.state // "?") cluster=\(.cluster_id // "n/a")"' <<<"${remaining_workspaces}"
-    } > "${run_dir}/workloads.remaining.txt"
-
-    warn "Waiting for current cloud workloads to terminate (jobs=${jobs_count} services=${services_count} workspaces=${workspaces_count}); see ${run_dir}/workloads.remaining.txt"
+    summary="$({
+      jq -r '.[] | "- workspace \(.name) (\(.id)) state=\(.state) cluster=\(.cluster_id // "n/a")"' <<<"${remaining_workspaces}"
+      jq -r '.[] | "- service \(.name) (\(.id)) state=\(.current_state // .state // .status // "UNKNOWN") project=\(.project_id // "n/a")"' <<<"${remaining_services}"
+      jq -r '.[] | "- job \(.name // .id) (\(.id)) state=\(.state // .current_state // .status // "UNKNOWN") project=\(.project_id // "n/a")"' <<<"${remaining_jobs}"
+    } | sed '/^$/d')"
+    warn "Waiting for current cloud workloads on ${cloud_name} to reach terminal states:"
+    printf '%s\n' "${summary}"
+    printf '%s\n' "${summary}" > "${run_dir}/workloads.remaining.txt"
 
     current_epoch="$(date +%s)"
     if (( current_epoch >= deadline )); then
-      die "Timed out waiting for current cloud workloads to terminate. Inspect ${run_dir}/workloads.remaining.txt before retrying destroy."
+      die "Timed out waiting for current cloud jobs, services, and workspaces to terminate. Inspect ${run_dir}/jobs.latest.json, ${run_dir}/services.latest.json, ${run_dir}/workspaces.latest.json, and ${run_dir}/workloads.remaining.txt before retrying destroy."
     fi
 
     sleep "${poll_interval_seconds}"
@@ -367,7 +370,7 @@ delete_cloud_in_arm() {
     printf '%s\n' "${output}" > "${delete_log}"
   else
     printf '%s\n' "${output}" > "${delete_log}"
-    die "Azure still refused to delete ${ANYSCALE_CLOUD_ARM_ID}. This temporary workaround runs before AKS teardown, so a failure here means the Anyscale control plane is still blocking cloud removal. See ${delete_log}."
+    die "Azure still refused to delete ${ANYSCALE_CLOUD_ARM_ID}. This helper runs before AKS teardown, so a failure here means the Anyscale control plane is still blocking cloud removal. See ${delete_log}."
   fi
 
   max_attempts=30
@@ -386,11 +389,11 @@ main() {
   local timeout_seconds="${DEFAULT_TIMEOUT_SECONDS}"
   local poll_interval_seconds="${DEFAULT_POLL_INTERVAL_SECONDS}"
   local cli_bin python_bin run_id run_dir
-  local clouds_json cloud_id
-  local schedules_json schedules_count schedule_json schedule_id schedule_name
-  local jobs_json non_terminal_jobs jobs_count job_json job_id job_name job_state
-  local services_json non_terminal_services services_count service_json service_id service_name service_state
-  local workspaces_json current_cloud_workspaces workspace_count
+  local clouds_json cloud_id services_json jobs_json workspaces_json
+  local current_cloud_services current_cloud_jobs current_cloud_workspaces
+  local service_count job_count workspace_count
+  local service_json service_id service_name service_state
+  local job_json job_id job_name job_state
   local workspace_json workspace_id workspace_name workspace_state cluster_id project_id
 
   while [[ $# -gt 0 ]]; do
@@ -433,10 +436,10 @@ main() {
   require_env_var AZURE_SUBSCRIPTION_ID
 
   run_id="$(date -u +%Y%m%dT%H%M%SZ)"
-  run_dir="${CACHE_DIR}/anyscale-destroy-workaround-${run_id}"
+  run_dir="${CACHE_DIR}/anyscale-cloud-teardown-${run_id}"
   mkdir -p "${run_dir}"
 
-  log "Running temporary Anyscale destroy workaround for ${ANYSCALE_CLOUD_NAME}"
+  log "Running Anyscale cloud teardown helper for ${ANYSCALE_CLOUD_NAME}"
   log "Artifacts will be written to ${run_dir}"
 
   run_with_timeout "${SETUP_TIMEOUT_AZURE_COMMAND_SECONDS}" \
@@ -454,56 +457,40 @@ main() {
 
   log "Mapped ${ANYSCALE_CLOUD_NAME} to Anyscale cloud id ${cloud_id}"
 
-  schedules_json="$(list_schedules_json "${cli_bin}")"
-  printf '%s\n' "${schedules_json}" > "${run_dir}/schedules.before.json"
-  schedules_count="$(jq 'length' <<<"${schedules_json}")"
-  if [[ "${schedules_count}" == "0" ]]; then
-    log "No current-cloud schedules were found."
+  services_json="$(list_services_json "${cli_bin}")"
+  printf '%s\n' "${services_json}" > "${run_dir}/services.before.json"
+  current_cloud_services="${services_json}"
+  service_count="$(jq 'length' <<<"${current_cloud_services}")"
+
+  if [[ "${service_count}" == "0" ]]; then
+    log "No current-cloud services were found for ${ANYSCALE_CLOUD_NAME}."
   else
-    log "Pausing ${schedules_count} schedules so they cannot re-trigger jobs during teardown."
-    while IFS= read -r schedule_json; do
-      [[ -n "${schedule_json}" ]] || continue
-      schedule_id="$(jq -r '.id // empty' <<<"${schedule_json}")"
-      schedule_name="$(jq -r '.name // "?"' <<<"${schedule_json}")"
-      [[ -n "${schedule_id}" ]] || continue
-      pause_schedule "${cli_bin}" "${schedule_id}" "${schedule_name}" "${run_dir}/schedule-pause.log"
-    done < <(jq -c '.[]' <<<"${schedules_json}")
+    while IFS= read -r service_json; do
+      [[ -n "${service_json}" ]] || continue
+      service_id="$(jq -r '.id' <<<"${service_json}")"
+      service_name="$(jq -r '.name' <<<"${service_json}")"
+      service_state="$(jq -r '(.current_state // .state // .status // "UNKNOWN") | ascii_upcase' <<<"${service_json}")"
+
+      terminate_service "${cli_bin}" "${service_id}" "${service_name}" "${service_state}" "${run_dir}/service-terminate.log"
+    done < <(jq -c '.[]' <<<"${current_cloud_services}")
   fi
 
   jobs_json="$(list_jobs_json "${cli_bin}")"
   printf '%s\n' "${jobs_json}" > "${run_dir}/jobs.before.json"
-  non_terminal_jobs="$(jq -c '[.[] | select((.state // "UNKNOWN") | test("^(SUCCEEDED|FAILED|TERMINATED)$") | not)]' <<<"${jobs_json}")"
-  jobs_count="$(jq 'length' <<<"${non_terminal_jobs}")"
-  if [[ "${jobs_count}" == "0" ]]; then
-    log "No non-terminal current-cloud jobs were found."
+  current_cloud_jobs="${jobs_json}"
+  job_count="$(jq 'length' <<<"${current_cloud_jobs}")"
+
+  if [[ "${job_count}" == "0" ]]; then
+    log "No current-cloud jobs were found for ${ANYSCALE_CLOUD_NAME}."
   else
-    log "Terminating ${jobs_count} non-terminal jobs."
     while IFS= read -r job_json; do
       [[ -n "${job_json}" ]] || continue
-      job_id="$(jq -r '.id // empty' <<<"${job_json}")"
-      job_name="$(jq -r '.name // "?"' <<<"${job_json}")"
-      job_state="$(jq -r '.state // "UNKNOWN"' <<<"${job_json}")"
-      [[ -n "${job_id}" ]] || continue
-      terminate_job "${cli_bin}" "${job_id}" "${job_name}" "${job_state}" "${run_dir}/job-terminate.log"
-    done < <(jq -c '.[]' <<<"${non_terminal_jobs}")
-  fi
+      job_id="$(jq -r '.id' <<<"${job_json}")"
+      job_name="$(jq -r '.name // .id' <<<"${job_json}")"
+      job_state="$(jq -r '(.state // .current_state // .status // "UNKNOWN") | ascii_upcase' <<<"${job_json}")"
 
-  services_json="$(list_services_json "${cli_bin}")"
-  printf '%s\n' "${services_json}" > "${run_dir}/services.before.json"
-  non_terminal_services="$(jq -c '[.[] | select((.state // "UNKNOWN") | test("^(TERMINATED|SYSTEM_FAILURE)$") | not)]' <<<"${services_json}")"
-  services_count="$(jq 'length' <<<"${non_terminal_services}")"
-  if [[ "${services_count}" == "0" ]]; then
-    log "No non-terminal current-cloud services were found."
-  else
-    log "Terminating ${services_count} non-terminal services."
-    while IFS= read -r service_json; do
-      [[ -n "${service_json}" ]] || continue
-      service_id="$(jq -r '.id // empty' <<<"${service_json}")"
-      service_name="$(jq -r '.name // "?"' <<<"${service_json}")"
-      service_state="$(jq -r '.state // "UNKNOWN"' <<<"${service_json}")"
-      [[ -n "${service_id}" ]] || continue
-      terminate_service "${cli_bin}" "${service_id}" "${service_name}" "${service_state}" "${run_dir}/service-terminate.log"
-    done < <(jq -c '.[]' <<<"${non_terminal_services}")
+      terminate_job "${cli_bin}" "${job_id}" "${job_name}" "${job_state}" "${run_dir}/job-terminate.log"
+    done < <(jq -c '.[]' <<<"${current_cloud_jobs}")
   fi
 
   workspaces_json="$(list_workspaces_json "${cli_bin}")"
@@ -528,16 +515,24 @@ main() {
     done < <(jq -c '.[]' <<<"${current_cloud_workspaces}")
   fi
 
-  wait_for_cloud_workloads_terminated "${cli_bin}" "${cloud_id}" "${timeout_seconds}" "${poll_interval_seconds}" "${run_dir}"
+  wait_for_cloud_workloads_drained "${cli_bin}" "${cloud_id}" "${ANYSCALE_CLOUD_NAME}" "${timeout_seconds}" "${poll_interval_seconds}" "${run_dir}"
   delete_cloud_in_arm "${run_dir}"
 
-  jobs_json="$(list_jobs_json "${cli_bin}")"
-  printf '%s\n' "${jobs_json}" > "${run_dir}/jobs.after.json"
-  services_json="$(list_services_json "${cli_bin}")"
+  if services_json="$(list_services_json "${cli_bin}" 2>/dev/null)"; then
+    :
+  else
+    services_json='[]'
+  fi
   printf '%s\n' "${services_json}" > "${run_dir}/services.after.json"
+  if jobs_json="$(list_jobs_json "${cli_bin}" 2>/dev/null)"; then
+    :
+  else
+    jobs_json='[]'
+  fi
+  printf '%s\n' "${jobs_json}" > "${run_dir}/jobs.after.json"
   workspaces_json="$(list_workspaces_json "${cli_bin}")"
   printf '%s\n' "${workspaces_json}" > "${run_dir}/workspaces.after.json"
-  log "Temporary Anyscale destroy workaround completed successfully."
+  log "Anyscale cloud teardown helper completed successfully."
 }
 
 main "$@"
