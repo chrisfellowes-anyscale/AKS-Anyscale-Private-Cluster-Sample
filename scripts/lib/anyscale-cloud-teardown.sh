@@ -79,65 +79,6 @@ list_workspaces_json() {
   local cli_bin="$1"
 
   run_with_timeout "${SETUP_TIMEOUT_ANYSCALE_COMMAND_SECONDS}" \
-    "${cli_bin}" workspace_v2 list \
-      -j \
-      --no-interactive \
-      --include-archived \
-      --max-items 500 \
-      --cloud "${ANYSCALE_CLOUD_NAME}"
-}
-
-list_jobs_json() {
-  local cli_bin="$1"
-
-  run_with_timeout "${SETUP_TIMEOUT_ANYSCALE_COMMAND_SECONDS}" \
-    "${cli_bin}" job list \
-      --v2 \
-      --cloud "${ANYSCALE_CLOUD_NAME}" \
-      --include-all-users \
-      --include-archived \
-      --no-interactive \
-      --max-items 500 \
-      -j
-}
-
-list_services_json() {
-  local cli_bin="$1"
-
-  run_with_timeout "${SETUP_TIMEOUT_ANYSCALE_COMMAND_SECONDS}" \
-    "${cli_bin}" service list \
-      --cloud "${ANYSCALE_CLOUD_NAME}" \
-      --include-archived \
-      --no-interactive \
-      --max-items 500 \
-      -j
-}
-
-list_schedules_json() {
-  local cli_bin="$1"
-
-  run_with_timeout "${SETUP_TIMEOUT_ANYSCALE_COMMAND_SECONDS}" \
-    "${cli_bin}" schedule list \
-      --v2 \
-      --cloud "${ANYSCALE_CLOUD_NAME}" \
-      --include-all-users \
-      --no-interactive \
-      --max-items 500 \
-      -j
-}
-
-is_terminal_job_state() {
-  case "$1" in
-    SUCCEEDED|FAILED|TERMINATED) return 0 ;;
-    *) return 1 ;;
-  esac
-}
-
-is_terminal_service_state() {
-  case "$1" in
-    TERMINATED|SYSTEM_FAILURE) return 0 ;;
-    *) return 1 ;;
-  esac
 }
 
 list_services_json() {
@@ -315,12 +256,7 @@ wait_for_cloud_workloads_drained() {
   deadline=$(( $(date +%s) + timeout_seconds ))
 
   while true; do
-    jobs_json="$(list_jobs_json "${cli_bin}")"
-    services_json="$(list_services_json "${cli_bin}")"
     workspaces_json="$(list_workspaces_json "${cli_bin}")"
-
-    printf '%s\n' "${jobs_json}" > "${run_dir}/jobs.latest.json"
-    printf '%s\n' "${services_json}" > "${run_dir}/services.latest.json"
     printf '%s\n' "${workspaces_json}" > "${run_dir}/workspaces.latest.json"
     services_json="$(list_services_json "${cli_bin}")"
     printf '%s\n' "${services_json}" > "${run_dir}/services.latest.json"
@@ -501,7 +437,6 @@ main() {
   if [[ "${workspace_count}" == "0" ]]; then
     log "No current-cloud workspaces were found for ${cloud_id}."
   else
-    log "Terminating ${workspace_count} workspaces (with belt-and-suspenders cluster termination)."
     while IFS= read -r workspace_json; do
       [[ -n "${workspace_json}" ]] || continue
       workspace_id="$(jq -r '.id' <<<"${workspace_json}")"
