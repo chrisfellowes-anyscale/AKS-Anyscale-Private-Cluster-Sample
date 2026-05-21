@@ -41,6 +41,17 @@ require_env_var() {
   [[ -n "${!name:-}" ]] || die "Required environment variable is missing: ${name}"
 }
 
+normalize_json_array_output() {
+  local payload="$1"
+
+  if [[ -z "${payload//[[:space:]]/}" ]]; then
+    printf '[]\n'
+    return 0
+  fi
+
+  printf '%s\n' "${payload}"
+}
+
 anyscale_cli_bin() {
   printf '%s\n' "${ROOT_DIR}/.venv/bin/anyscale"
 }
@@ -71,51 +82,71 @@ load_env_defaults() {
 list_clouds_json() {
   local cli_bin="$1"
 
-  run_with_timeout "${SETUP_TIMEOUT_ANYSCALE_COMMAND_SECONDS}" \
-    "${cli_bin}" cloud list -j --no-interactive --max-items 200
+  normalize_json_array_output "$({
+    run_with_timeout "${SETUP_TIMEOUT_ANYSCALE_COMMAND_SECONDS}" \
+      "${cli_bin}" cloud list -j --no-interactive --max-items 200
+  })"
 }
 
 list_workspaces_json() {
   local cli_bin="$1"
 
-  run_with_timeout "${SETUP_TIMEOUT_ANYSCALE_COMMAND_SECONDS}" \
-  "${cli_bin}" workspace_v2 list \
-    -j \
-    --no-interactive \
-    --include-archived \
-    --max-items 500 \
-    --cloud "${ANYSCALE_CLOUD_NAME}"
+  normalize_json_array_output "$({
+    run_with_timeout "${SETUP_TIMEOUT_ANYSCALE_COMMAND_SECONDS}" \
+      "${cli_bin}" workspace_v2 list \
+        -j \
+        --no-interactive \
+        --include-archived \
+        --max-items 500 \
+        --cloud "${ANYSCALE_CLOUD_NAME}"
+  })"
 }
 
 list_services_json() {
   local cli_bin="$1"
 
-  run_with_timeout "${SETUP_TIMEOUT_ANYSCALE_COMMAND_SECONDS}" \
-    "${cli_bin}" service list \
-      --cloud "${ANYSCALE_CLOUD_NAME}" \
-      --include-archived \
-      -j \
-      --no-interactive \
-      --max-items 500
+  normalize_json_array_output "$({
+    run_with_timeout "${SETUP_TIMEOUT_ANYSCALE_COMMAND_SECONDS}" \
+      "${cli_bin}" service list \
+        --cloud "${ANYSCALE_CLOUD_NAME}" \
+        --include-archived \
+        -j \
+        --no-interactive \
+        --max-items 500
+  })"
 }
 
 list_jobs_json() {
   local cli_bin="$1"
 
-  run_with_timeout "${SETUP_TIMEOUT_ANYSCALE_COMMAND_SECONDS}" \
-    "${cli_bin}" job list \
-      --v2 \
-      --cloud "${ANYSCALE_CLOUD_NAME}" \
-      --include-all-users \
-      --include-archived \
-      -j \
-      --no-interactive \
-      --max-items 500
+  normalize_json_array_output "$({
+    run_with_timeout "${SETUP_TIMEOUT_ANYSCALE_COMMAND_SECONDS}" \
+      "${cli_bin}" job list \
+        --v2 \
+        --cloud "${ANYSCALE_CLOUD_NAME}" \
+        --include-all-users \
+        --include-archived \
+        -j \
+        --no-interactive \
+        --max-items 500
+  })"
 }
 
 cloud_exists_in_arm() {
   run_with_timeout "${SETUP_TIMEOUT_AZURE_COMMAND_SECONDS}" \
     az resource show --ids "${ANYSCALE_CLOUD_ARM_ID}" --only-show-errors >/dev/null 2>&1
+}
+
+default_cloud_resource_arm_id() {
+  printf '%s/cloudResources/default\n' "${ANYSCALE_CLOUD_ARM_ID}"
+}
+
+default_cloud_resource_exists_in_arm() {
+  local cloud_resource_arm_id
+  cloud_resource_arm_id="$(default_cloud_resource_arm_id)"
+
+  run_with_timeout "${SETUP_TIMEOUT_AZURE_COMMAND_SECONDS}" \
+    az resource show --ids "${cloud_resource_arm_id}" --only-show-errors >/dev/null 2>&1
 }
 
 terminate_workspace() {
@@ -300,7 +331,32 @@ wait_for_cloud_workloads_drained() {
 delete_cloud_in_arm() {
   local run_dir="$1"
   local delete_log="${run_dir}/arm-delete.log"
-  local output attempt max_attempts
+  local output attempt max_attempts cloud_resource_arm_id
+
+  cloud_resource_arm_id="$(default_cloud_resource_arm_id)"
+
+  if default_cloud_resource_exists_in_arm; then
+    if output="$(run_with_timeout "${SETUP_TIMEOUT_AZURE_COMMAND_SECONDS}" \
+      az resource delete --ids "${cloud_resource_arm_id}" --only-show-errors 2>&1)"; then
+      printf '%s\n' "${output}" > "${run_dir}/arm-delete-cloud-resource.log"
+    else
+      printf '%s\n' "${output}" > "${run_dir}/arm-delete-cloud-resource.log"
+      die "Azure refused to delete nested cloud resource ${cloud_resource_arm_id}. See ${run_dir}/arm-delete-cloud-resource.log."
+    fi
+
+    max_attempts=30
+    for ((attempt = 1; attempt <= max_attempts; attempt++)); do
+      if ! default_cloud_resource_exists_in_arm; then
+        log "Azure nested cloud resource ${cloud_resource_arm_id} was deleted before parent cloud removal."
+        break
+      fi
+      sleep 10
+    done
+
+    if default_cloud_resource_exists_in_arm; then
+      die "Azure accepted the delete for nested cloud resource ${cloud_resource_arm_id}, but it still exists after waiting. See ${run_dir}/arm-delete-cloud-resource.log."
+    fi
+  fi
 
   if ! cloud_exists_in_arm; then
     log "Azure resource ${ANYSCALE_CLOUD_ARM_ID} is already absent."
