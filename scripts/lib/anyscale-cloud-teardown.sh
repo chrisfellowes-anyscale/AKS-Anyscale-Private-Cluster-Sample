@@ -79,6 +79,12 @@ list_workspaces_json() {
   local cli_bin="$1"
 
   run_with_timeout "${SETUP_TIMEOUT_ANYSCALE_COMMAND_SECONDS}" \
+  "${cli_bin}" workspace_v2 list \
+    -j \
+    --no-interactive \
+    --include-archived \
+    --max-items 500 \
+    --cloud "${ANYSCALE_CLOUD_NAME}"
 }
 
 list_services_json() {
